@@ -24,7 +24,7 @@ copy proxies\cocks5.txt.example proxies\cocks5.txt
 copy accounts\input\accounts.example.txt accounts\input\import_active.txt
 ```
 
-1. 按 `assets/README.md` 放入本地 APK（Venmo bundle / NekoBox / Kitsune / Aurora）
+1. 小型 APK（NekoBox / Kitsune / Aurora / Venmo splits）已随仓库提供；仅需自行放入 ssets/apk/venmo_bundle/base.apk（约 161MB，超 GitHub 单文件限制）
 2. 编辑 `proxies\cocks5.txt` 写入 SOCKS5
 3. 编辑 `accounts\input\import_active.txt` 写入账号
 4. 启动：
@@ -78,10 +78,11 @@ mumuvenmo/
 - 真实账号/密码
 - 真实代理凭据
 - 运行日志、截图、导出结果
-- 第三方 APK 安装包（体积/版权原因需自行准备）
+- 超大 Venmo ase.apk（需自行准备；其余小型 APK 已随仓库提供）
 
 请勿把含真实凭据的文件提交到 Git。
 
 ## License
 
 Private use / source snapshot. Third-party APKs and modules remain under their original licenses.
+

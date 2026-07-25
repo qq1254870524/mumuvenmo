@@ -31,12 +31,9 @@ data/state/*
 screenshots/**/*
 !screenshots/**/.gitkeep
 
-# large / third-party binaries
-assets/apk/**
-!assets/apk/.gitkeep
-!assets/apk/venmo_bundle/
-!assets/apk/venmo_bundle/.gitkeep
-*.apk
+# large APK blocked (GitHub soft limit 100MB)
+assets/apk/venmo_bundle/base.apk
+assets/apk/venmo_base_only_BROKEN.apk
 
 # local machine config may be customized; keep example
 config.json
