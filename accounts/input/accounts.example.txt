@@ -1,0 +1,4 @@
+﻿# account----password
+# account1----password----account2----residual----name
+1000000000----ExamplePass1
+2000000000----ExamplePass2----alt_user----residual----Example Name

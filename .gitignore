@@ -1,0 +1,47 @@
+﻿# runtime / secrets
+__pycache__/
+*.py[cod]
+*.log
+*.log.*
+*.png
+*.jpg
+*.jpeg
+*.flag
+
+# local secrets and runtime outputs
+accounts/input/*
+!accounts/input/accounts.example.txt
+!accounts/input/.gitkeep
+accounts/samples/*
+!accounts/samples/README.txt
+!accounts/samples/.gitkeep
+proxies/*
+!proxies/cocks5.txt.example
+!proxies/.gitkeep
+export/**/*
+!export/**/.gitkeep
+logs/**/*
+!logs/**/.gitkeep
+data/setup_flags/*
+!data/setup_flags/.gitkeep
+data/nekobox_profiles/*
+!data/nekobox_profiles/.gitkeep
+data/state/*
+!data/state/.gitkeep
+screenshots/**/*
+!screenshots/**/.gitkeep
+
+# large / third-party binaries
+assets/apk/**
+!assets/apk/.gitkeep
+!assets/apk/venmo_bundle/
+!assets/apk/venmo_bundle/.gitkeep
+*.apk
+
+# local machine config may be customized; keep example
+config.json
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini

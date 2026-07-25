@@ -1,0 +1,53 @@
+﻿{
+    "stop_join_timeout_seconds":  1800,
+    "no_network_retry_after_refresh":  1,
+    "venmo_local_install":  true,
+    "auto_sort_windows":  true,
+    "use_nekobox":  true,
+    "adb_base_port":  16384,
+    "login_timeout_seconds":  90,
+    "create_launch_workers":  1,
+    "boot_timeout_seconds":  420,
+    "nekobox_package":  "moe.nb4a",
+    "restart_interval_minutes":  0,
+    "window_auto_fit":  true,
+    "kitsune_package":  "io.github.huskydg.magisk",
+    "export_dir":  "",
+    "reuse_existing_vms_on_start":  true,
+    "window_height":  640,
+    "proxy_refresh_wait_seconds":  5,
+    "workers":  1,
+    "adb_path":  "C:\\\\Program Files\\\\Netease\\\\MuMuPlayer\\\\nx_main\\\\adb.exe",
+    "last_selected_vms":  [
+
+                          ],
+    "consecutive_risk_nonet_limit":  5,
+    "adb_port_step":  32,
+    "create_count":  1,
+    "window_margin":  0,
+    "mumu_manager":  "C:\\\\Program Files\\\\Netease\\\\MuMuPlayer\\\\nx_main\\\\MuMuManager.exe",
+    "venmo_package":  "com.venmo",
+    "prefer_aurora_venmo":  false,
+    "install_packages":  {
+                             "aurora":  false,
+                             "venmo":  true,
+                             "nekobox":  true,
+                             "ih8":  true,
+                             "kitsune":  true
+                         },
+    "stop_shutdown_vms":  true,
+    "proxy_refresh_min_interval_seconds":  180,
+    "window_width":  360,
+    "create_defaults":  {
+                            "performance_mem":  2,
+                            "resolution_width":  1440,
+                            "resolution_dpi":  640,
+                            "resolution_height":  2560,
+                            "performance_cpu":  2,
+                            "root_permission":  true,
+                            "mini_disk":  true,
+                            "performance_mode":  "custom",
+                            "system_disk_readonly":  false
+                        },
+    "mumu_root":  "C:\\\\Program Files\\\\Netease\\\\MuMuPlayer"
+}

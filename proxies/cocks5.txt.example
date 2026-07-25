@@ -1,0 +1,5 @@
+﻿# One SOCKS5 per line. Supported examples:
+# host:port
+# host:port:user:pass
+# socks5://user:pass@host:port
+127.0.0.1:1080
