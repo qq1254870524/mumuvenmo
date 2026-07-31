@@ -1,3 +1,4 @@
+# 2026-07-31 immediate-stop-v1: force 停登录时打断 ADB，join 上限 8s
 # 2026-07-25 layout-tight-v1: 登录线程一字紧贴排列 auto_fit margin=0
 # -*- coding: utf-8 -*-
 """多线程 Worker：启模拟器 -> STEP1 Kitsune -> 装包 -> STEP3 NekoBox代理 -> 登录 -> 导出。
@@ -171,8 +172,13 @@ class WorkerEngine:
                 self._force_stop_event.set()
             except Exception:
                 pass
-            join_timeout = min(float(join_timeout), 12.0)
-            self.log(f"强制停止: join_timeout 压缩为 {join_timeout:.0f}s，超时后仍可关模拟器")
+            try:
+                from core.adb_client import AdbClient
+                AdbClient.request_cancel_all()
+            except Exception as exc:
+                self.log(f"强制停止中断 ADB 失败: {exc}")
+            join_timeout = min(float(join_timeout), 8.0)
+            self.log(f"强制停止: join_timeout 压缩为 {join_timeout:.0f}s，已请求取消 ADB，超时后仍可关模拟器")
         else:
             # 新一轮优雅停止：清除旧强制标记
             try:
@@ -1616,3 +1622,5 @@ class WorkerEngine:
         self.proxy_pool.release(f"vm-{vmindex}")
         self.log(f"{worker_id} 线程结束 VM={vmindex}")
         self.log(f"{worker_id} 结束")
+
+

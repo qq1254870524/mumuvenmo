@@ -1,3 +1,10 @@
+# 2026-07-31 install-heal-fast-v3: pure TIMEOUT/package-dead 不再空重试，立刻返回促 MuMu heal
+# 2026-07-31 instant-stop-v2: cancel 轮询保持可重入
+# 2026-07-31 package-installed-hangfix-v4: pm 连续超时快速失败+service check；install 首超 120s 促 heal
+# 2026-07-31 package-service-heal-v1: install/pm 遇 package 服务挂掉则重连再试
+# 2026-07-31 taskkill-tree-v1: 超时/取消用 taskkill /T 杀 adb 进程树，防僵尸堵串口
+# 2026-07-31 pipe-deadlock-fix-v1: communicate线程读PIPE，避免cat ui.xml互锁超时
+# 2026-07-31 zombie-cancel-v2: stacked cancel checks + wait_device cancel
 # -*- coding: utf-8 -*-
 # 2026-07-25 grant-no-deny-v1: Magisk GRANT 只点 id/grant 或精确 GRANT 文本，禁用 deny_right，空树区分 Magisk/MuMu
 # 2026-07-25 shell-su-quote-v1: su -c 整段命令单参数，修复 magisk --install-module 被 su 拆参
@@ -10,7 +17,18 @@
 更新 2026-07-25 shareduid-grant-click-v1: Magisk SuRequest 见 GRANT/[SharedUID] Shell 时直接点 GRANT。"""
 from __future__ import annotations
 
+# 2026-07-31 concurrent-adb-v2: 单实例后 global=10 heavy=6，10台可同步装包
+# 2026-07-31 package-installed-v3: 缩短 pm path 超时+连续软失败重连；配合 taskkill-tree
+# 2026-07-31 package-installed-v2: pm path 软失败多试 + pm list packages 兜底，防 Success 后假缺失
+# 2026-07-31 concurrent-adb-v1: 10路并行 force-stop/pm 超时软失败; 全局限流; su-grant 降频
+# 2026-07-31 install-timeout-retry-v1: install TIMEOUT/offline 重连再试；package_installed 严格匹配
+# 2026-07-31 heavy-install-v1: install/push 全局限3; 可中断Popen; package_installed加固
+# 2026-07-31 zombie-cancel-v1+adb-pressure: global=6 heavy=4; interruptible acquire; offline retry
+# 2026-07-31 immediate-stop-v1: request_cancel_all/interrupt_all 杀活动adb
+
 import logging
+import os
+import threading
 import re
 import subprocess
 import time
@@ -29,19 +47,280 @@ class AdbClient:
             raise FileNotFoundError(f"adb 不存在: {self.adb}")
         self._last_dump_xml = ""
         self._last_dump_ts = 0.0
-        self._dump_min_interval = 1.6
+        self._dump_min_interval = 2.0
 
+
+    # 同类串口互斥，避免同 VM 主线程 + su-grant 双路 uiautomator 互抢
+    _serial_locks: dict[str, "threading.RLock"] = {}
+    _serial_locks_guard = threading.Lock()
+    # 全局 ADB 并发：单实例下 10 台可并行；12 易 thrash
+    _global_adb_sema = threading.Semaphore(10)
+    # 重操作(install/push) 全局限流：6 路同步装包
+    _heavy_adb_sema = threading.Semaphore(6)
+    _cancel_all = threading.Event()
+    _active_procs_guard = threading.Lock()
+    _active_procs = {}
+    _instance_cancel_checks_guard = threading.Lock()
+    _instance_cancel_checks = {}
+
+    @classmethod
+    def request_cancel_all(cls):
+        cls._cancel_all.set()
+        cls.interrupt_all()
+
+    @classmethod
+    def clear_cancel_all(cls):
+        cls._cancel_all.clear()
+
+    @classmethod
+    def interrupt_all(cls):
+        killed = 0
+        with cls._active_procs_guard:
+            items = list(cls._active_procs.items())
+        for pid, proc in items:
+            try:
+                if cls._kill_proc_tree(proc):
+                    killed += 1
+            except Exception:
+                pass
+        if killed:
+            logger.warning("ADB interrupt_all killed=%s", killed)
+        return killed
+
+
+    @staticmethod
+    def _kill_proc_tree(proc) -> bool:
+        """Windows 上 adb 常有子进程；只 kill 父进程会留僵尸占串口。"""
+        if proc is None:
+            return False
+        pid = getattr(proc, "pid", None)
+        if not pid:
+            return False
+        killed = False
+        try:
+            if proc.poll() is None:
+                # 先 taskkill 整树（含子进程）
+                if os.name == "nt":
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(pid)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=5,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                        killed = True
+                    except Exception:
+                        pass
+                try:
+                    if proc.poll() is None:
+                        proc.kill()
+                        killed = True
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=1.5)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return killed
+
+
+    @classmethod
+    def _register_proc(cls, proc):
+        try:
+            with cls._active_procs_guard:
+                cls._active_procs[int(proc.pid)] = proc
+        except Exception:
+            pass
+
+    @classmethod
+    def _unregister_proc(cls, proc):
+        if proc is None:
+            return
+        try:
+            with cls._active_procs_guard:
+                cls._active_procs.pop(int(proc.pid), None)
+        except Exception:
+            pass
+
+    def set_cancel_check(self, fn):
+        # stacked cancel: 多线程可叠加；任一 True 即取消（避免新任务覆盖旧检查导致僵尸复活）
+        try:
+            with self._instance_cancel_checks_guard:
+                if fn is None:
+                    self._instance_cancel_checks.pop(self.serial, None)
+                else:
+                    cur = self._instance_cancel_checks.get(self.serial)
+                    if cur is None:
+                        self._instance_cancel_checks[self.serial] = [fn]
+                    elif isinstance(cur, list):
+                        if fn not in cur:
+                            cur.append(fn)
+                    else:
+                        self._instance_cancel_checks[self.serial] = [cur, fn] if cur is not fn else [cur]
+        except Exception:
+            pass
+
+    def _cancel_requested(self):
+        if self._cancel_all.is_set():
+            return True
+        try:
+            with self._instance_cancel_checks_guard:
+                cur = self._instance_cancel_checks.get(self.serial)
+            if cur is None:
+                return False
+            fns = cur if isinstance(cur, list) else [cur]
+            for fn in list(fns):
+                try:
+                    if callable(fn) and bool(fn()):
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def _is_heavy_args(self, args):
+        if not args:
+            return False
+        head = str(args[0]).lower()
+        return head in ("install", "install-multiple", "push")
+
+    def _acquire_interruptible(self, sema, timeout: float) -> bool:
+        """停止任务时可打断的信号量等待。"""
+        deadline = time.time() + max(0.2, float(timeout))
+        while True:
+            if self._cancel_requested():
+                return False
+            if sema.acquire(timeout=0.2):
+                return True
+            if time.time() >= deadline:
+                return False
+
+    @classmethod
+    def _lock_for(cls, serial: str):
+        with cls._serial_locks_guard:
+            lk = cls._serial_locks.get(serial)
+            if lk is None:
+                lk = threading.RLock()
+                cls._serial_locks[serial] = lk
+            return lk
 
     def _run(self, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
         cmd = [str(self.adb), "-s", self.serial, *args]
         logger.debug("ADB: %s", " ".join(cmd))
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=timeout,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-        )
+        if self._cancel_requested():
+            return subprocess.CompletedProcess(cmd, 130, "", "adb_cancelled")
+        flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        heavy = self._is_heavy_args(args)
+        heavy_got = False
+        heavy_waited = 0.0
+        if heavy:
+            t0 = time.time()
+            heavy_got = self._acquire_interruptible(self._heavy_adb_sema, max(30, int(timeout) + 30))
+            heavy_waited = time.time() - t0
+            if not heavy_got:
+                if self._cancel_requested():
+                    return subprocess.CompletedProcess(cmd, 130, "", "adb_cancelled")
+                logger.warning("ADB heavy sema wait timeout waited=%.1fs: %s", heavy_waited, " ".join(cmd)[:180])
+                return subprocess.CompletedProcess(cmd, 124, "", "adb_heavy_sema_timeout")
+            logger.info(
+                "ADB heavy begin serial=%s waited=%.1fs cmd=%s",
+                self.serial, heavy_waited, " ".join(cmd)[:160],
+            )
+        got = self._acquire_interruptible(self._global_adb_sema, max(5, int(timeout) + 5))
+        if not got:
+            if heavy and heavy_got:
+                try:
+                    self._heavy_adb_sema.release()
+                except Exception:
+                    pass
+            if self._cancel_requested():
+                return subprocess.CompletedProcess(cmd, 130, "", "adb_cancelled")
+            logger.warning("ADB sema wait timeout: %s", " ".join(cmd)[:180])
+            return subprocess.CompletedProcess(cmd, 124, "", "adb_sema_timeout")
+        proc = None
+        t_run = time.time()
+        try:
+            if self._cancel_requested():
+                return subprocess.CompletedProcess(cmd, 130, "", "adb_cancelled")
+            # pipe-deadlock-fix-v1:
+            # 大输出(cat ui.xml / dumpsys)若只用 poll 不读 PIPE，子进程写满缓冲区会互锁到超时。
+            # 用线程 communicate + 可取消等待。
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=flags,
+            )
+            self._register_proc(proc)
+            deadline = time.time() + max(1, int(timeout))
+            result_box: dict = {}
+
+            def _comm() -> None:
+                try:
+                    out, err = proc.communicate()
+                    result_box["out"] = out or ""
+                    result_box["err"] = err or ""
+                    result_box["rc"] = proc.returncode if proc.returncode is not None else 0
+                except Exception as exc:
+                    result_box["out"] = ""
+                    result_box["err"] = str(exc)
+                    result_box["rc"] = 125
+
+            th = threading.Thread(target=_comm, name=f"adb-comm-{self.serial}", daemon=True)
+            th.start()
+            while th.is_alive():
+                if self._cancel_requested():
+                    self._kill_proc_tree(proc)
+                    th.join(timeout=1.5)
+                    out = str(result_box.get("out") or "")
+                    err = str(result_box.get("err") or "")
+                    return subprocess.CompletedProcess(
+                        cmd, 130, out, (err + "\nadb_cancelled").strip()
+                    )
+                if time.time() >= deadline:
+                    self._kill_proc_tree(proc)
+                    th.join(timeout=1.5)
+                    out = str(result_box.get("out") or "")
+                    err = str(result_box.get("err") or "")
+                    logger.warning("ADB timeout %ss: %s", timeout, " ".join(cmd)[:180])
+                    return subprocess.CompletedProcess(
+                        cmd, 124, out, (err + f"\nTIMEOUT:{timeout}").strip()
+                    )
+                time.sleep(0.05)
+            out = str(result_box.get("out") or "")
+            err = str(result_box.get("err") or "")
+            rc = int(result_box.get("rc", proc.returncode if proc.returncode is not None else 0) or 0)
+            return subprocess.CompletedProcess(cmd, rc, out, err)
+        except Exception as exc:
+            logger.warning("ADB err: %s | %s", exc, " ".join(cmd)[:160])
+            try:
+                if proc is not None and proc.poll() is None:
+                    self._kill_proc_tree(proc)
+            except Exception:
+                pass
+            return subprocess.CompletedProcess(cmd, 125, "", str(exc))
+        finally:
+            self._unregister_proc(proc)
+            try:
+                self._global_adb_sema.release()
+            except Exception:
+                pass
+            if heavy and heavy_got:
+                try:
+                    self._heavy_adb_sema.release()
+                except Exception:
+                    pass
+                logger.info(
+                    "ADB heavy end serial=%s elapsed=%.1fs waited=%.1fs cmd=%s",
+                    self.serial, time.time() - t_run, heavy_waited, " ".join(cmd)[:120],
+                )
 
     def connect(self) -> bool:
         host, _, port = self.serial.partition(":")
@@ -190,7 +469,7 @@ class AdbClient:
                         logger.debug("auto-grant intermediate (not final): %s @ %s", hit, self.serial)
                 except Exception as exc:
                     logger.debug("auto-grant dismiss err: %s", exc)
-                if stop.wait(0.28):
+                if stop.wait(0.55):
                     break
 
         th = threading.Thread(target=_loop, name=f"su-grant-{self.serial}", daemon=True)
@@ -1225,13 +1504,19 @@ echo GRANT_SHELL_DONE
     def wait_device(self, timeout: int = 120) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if self._cancel_requested():
+                return False
             try:
                 out = self.shell("getprop", "sys.boot_completed", timeout=15).strip()
                 if out.splitlines()[-1:] == ["1"] or out.endswith("1"):
                     return True
             except Exception:
                 pass
-            time.sleep(2)
+            end = time.time() + 2
+            while time.time() < end:
+                if self._cancel_requested():
+                    return False
+                time.sleep(0.2)
         return False
 
 
@@ -1295,7 +1580,7 @@ wm size 2>/dev/null || true
         return self.shell("pm", "clear", package, timeout=60)
 
     def force_stop(self, package: str) -> str:
-        return self.shell("am", "force-stop", package, timeout=30)
+        return self.shell("am", "force-stop", package, timeout=3)
 
     def start_app(self, package: str) -> str:
         # Venmo 等包 am start 常无法 resolve，优先 monkey
@@ -1311,9 +1596,88 @@ wm size 2>/dev/null || true
         )
         return (out or "") + "\n" + (out2 or "")
 
+    def _run_install_with_offline_retry(self, args: list[str], timeout: int) -> str:
+        """install-heal-fast-v3: offline reconnect-retry; pure TIMEOUT/package-dead return for MuMu heal."""
+        def _once(tmo: int) -> str:
+            cp = self._run(args, timeout=tmo)
+            return ((cp.stdout or "") + (cp.stderr or "")).strip()
+
+        def _is_timeout(low: str) -> bool:
+            return (
+                f"timeout:{timeout}" in low
+                or low.strip().endswith(f"timeout:{timeout}")
+                or ("timeout:" in low)
+                or low.startswith("timeout:")
+                or "adb_sema_timeout" in low
+                or "adb_heavy_sema_timeout" in low
+            )
+
+        def _is_offline(low: str) -> bool:
+            return (
+                "device offline" in low
+                or "device not found" in low
+                or "no devices" in low
+                or "connection reset" in low
+            )
+
+        def _is_pkg_dead(low: str) -> bool:
+            return (
+                "can't find service: package" in low
+                or "cannot find service: package" in low
+                or "find service: package" in low
+                or "broken pipe" in low
+                or "error: closed" in low
+            )
+
+        text = _once(timeout)
+        if self._cancel_requested():
+            return text or "adb_cancelled"
+        low = text.lower()
+        half = ("performing streamed install" in low) and ("success" not in low)
+        timed = _is_timeout(low)
+        offline = _is_offline(low)
+        pkg_dead = _is_pkg_dead(low)
+        if not (timed or offline or pkg_dead or half):
+            return text
+
+        # install-heal-fast-v3: dead package service or pure TIMEOUT -> no blind second install
+        service_dead = False
+        try:
+            if timed or pkg_dead or half:
+                if not self.package_service_alive():
+                    service_dead = True
+        except Exception:
+            service_dead = True
+        if service_dead or (timed and not offline) or pkg_dead:
+            logger.info(
+                "ADB install skip-blind-retry serial=%s timed=%s pkg_dead=%s service_dead=%s half=%s -> heal-upper",
+                self.serial, timed, pkg_dead, service_dead, half,
+            )
+            marker = "NEED_PACKAGE_SERVICE_HEAL"
+            if marker.lower() not in low:
+                text = (text + chr(10) + marker).strip()
+            return text
+
+        # offline/transient only: reconnect once
+        try:
+            self.connect()
+        except Exception:
+            pass
+        time.sleep(1.2)
+        if self._cancel_requested():
+            return "adb_cancelled"
+        t2 = max(int(timeout), int(timeout * 1.25))
+        text2 = _once(t2)
+        logger.info(
+            "ADB install retry serial=%s reason=offline_or_transient -> %s",
+            self.serial,
+            text2[:120],
+        )
+        return text2
+
     def install(self, apk: str | Path) -> str:
-        cp = self._run(["install", "-r", str(apk)], timeout=300)
-        return (cp.stdout or "") + (cp.stderr or "")
+        # kitsune/large apk under multi-VM pressure often >180s
+        return self._run_install_with_offline_retry(["install", "-r", str(apk)], 120)
 
     def install_multiple(self, apks: list[str | Path], replace: bool = True) -> str:
         """完整 split 包安装。禁止把 Venmo 只装 base.apk。"""
@@ -1321,8 +1685,7 @@ wm size 2>/dev/null || true
         if replace:
             args.append("-r")
         args.extend(str(p) for p in apks)
-        cp = self._run(args, timeout=600)
-        return (cp.stdout or "") + (cp.stderr or "")
+        return self._run_install_with_offline_retry(args, 420)
 
     def uninstall(self, package: str) -> str:
         cp = self._run(["uninstall", package], timeout=60)
@@ -1461,7 +1824,7 @@ wm size 2>/dev/null || true
                 import time as _t
                 _t.sleep(0.8)
                 continue
-            cp = self._run(["shell", "cat", remote], timeout=30)
+            cp = self._run(["shell", "cat", remote], timeout=12)
             xml = cp.stdout or ""
             if xml.strip().startswith("<?xml") or "<hierarchy" in xml or "<node" in xml:
                 self._last_dump_xml = xml
@@ -1470,7 +1833,7 @@ wm size 2>/dev/null || true
             # empty file: brief wait and retry
             import time as _t
             _t.sleep(0.5)
-        cp = self._run(["shell", "cat", remote], timeout=30)
+        cp = self._run(["shell", "cat", remote], timeout=12)
         xml = cp.stdout or ""
         if xml:
             self._last_dump_xml = xml
@@ -1640,6 +2003,134 @@ wm size 2>/dev/null || true
             except Exception:
                 pass
 
+    def package_service_alive(self) -> bool:
+        """快速判断 package 服务是否还活着（高并发 hang 检测）。"""
+        try:
+            out = self.shell("service", "check", "package", timeout=5) or ""
+        except Exception as exc:
+            out = str(exc)
+        low = (out or "").lower()
+        if "timeout" in low or "device offline" in low or "not found" in low or "no devices" in low:
+            return False
+        # Service package: found
+        if "found" in low and "not found" not in low:
+            return True
+        if "cannot find" in low or "can't find" in low or "find service: package" in low:
+            return False
+        # 空/未知偏保守：不直接判死，交给上层超时逻辑
+        return True
+
     def package_installed(self, package: str) -> bool:
-        out = self.shell("pm", "path", package, timeout=20)
-        return package in out or "package:" in out
+        """高并发下 pm path 易超时：短超时 + 少次重试 + list packages 兜底。
+
+        package-installed-hangfix-v4:
+        - 只认 package:<path> 且含包名
+        - soft-fail（timeout/empty/offline/sema）少次快退，避免 6 台互堵数分钟
+        - 连续超时后 service check；服务挂则立刻 False 让上层 install/heal
+        - 仍不确定时用 `pm list packages <pkg>` 精确兜底，避免 Success 后假阴性
+        """
+        out = ""
+        pkg = str(package or "").strip()
+        if not pkg:
+            return False
+
+        def _path_hit(text: str) -> bool:
+            for line in (text or "").splitlines():
+                ls = line.strip()
+                if ls.lower().startswith("package:") and pkg in ls:
+                    return True
+            return False
+
+        def _soft_fail(text: str) -> bool:
+            low = (text or "").lower()
+            return (
+                "timeout" in low
+                or (text or "").strip() == ""
+                or "adb_sema_timeout" in low
+                or "adb_heavy_sema_timeout" in low
+                or "device offline" in low
+                or "not found" in low
+                or "error:" in low
+                or "no devices" in low
+                or "can't find service: package" in low
+                or "cannot find service: package" in low
+                or "find service: package" in low
+                or "broken pipe" in low
+                or "error: closed" in low
+            )
+
+        soft_timeouts = 0
+        for attempt in range(3):
+            if self._cancel_requested():
+                return False
+            try:
+                out = self.shell("pm", "path", pkg, timeout=8) or ""
+            except Exception as exc:
+                out = str(exc)
+            if _path_hit(out):
+                return True
+            if _soft_fail(out):
+                soft_timeouts += 1
+                try:
+                    low = out.lower()
+                    if (
+                        "device offline" in low
+                        or "not found" in low
+                        or "no devices" in low
+                        or "find service: package" in low
+                        or "broken pipe" in low
+                        or soft_timeouts >= 2
+                    ):
+                        self.connect()
+                except Exception:
+                    pass
+                # 连续 2 次软失败：若 package 服务挂了，立刻返回 False 促 heal/重装
+                if soft_timeouts >= 2:
+                    try:
+                        if not self.package_service_alive():
+                            return False
+                    except Exception:
+                        return False
+                time.sleep(0.25 + 0.2 * attempt)
+                continue
+            break
+
+        # list packages 兜底（高并发 pm path 空/超时假阴性）
+        list_soft = 0
+        for attempt in range(2):
+            if self._cancel_requested():
+                return False
+            try:
+                listed = self.shell("pm", "list", "packages", pkg, timeout=8) or ""
+            except Exception as exc:
+                listed = str(exc)
+            for line in (listed or "").splitlines():
+                ls = line.strip()
+                # package:com.xxx 精确匹配，避免前缀误伤
+                if ls.lower() == f"package:{pkg}".lower() or ls.lower().startswith(f"package:{pkg.lower()}="):
+                    return True
+                if ls.lower() == f"package:{pkg}".lower():
+                    return True
+            low = (listed or "").lower()
+            needle = f"package:{pkg.lower()}"
+            # 整词行匹配
+            for line in (listed or "").splitlines():
+                if line.strip().lower() == needle:
+                    return True
+            if _soft_fail(listed):
+                list_soft += 1
+                try:
+                    if "device offline" in low or "not found" in low or list_soft >= 1:
+                        self.connect()
+                except Exception:
+                    pass
+                if list_soft >= 1:
+                    try:
+                        if not self.package_service_alive():
+                            return False
+                    except Exception:
+                        return False
+                time.sleep(0.3 + 0.2 * attempt)
+                continue
+            break
+        return False

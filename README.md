@@ -1,19 +1,16 @@
-﻿# mumuvenmo
+# mumuvenmo
 
-MuMu 模拟器 Venmo 登录器（本地 GUI 工具）。
+MuMu 多开 + Venmo 装包/登录自动化（本地工具）。
 
-- 多线程启动/管理 MuMu 模拟器
-- 账号导入、自动分配、实时分类导出
-- 可选 NekoBox SOCKS5 代理
-- Kitsune Mask / ih8 模块初始化流程
-- 所有运行产物默认限制在项目目录内
+## 2026-07-31 更新摘要
 
-## 环境要求
+- 多开同步装包：新建 N 台可 N 台并行走完后半段（不再只剩 3~4 台）
+- 装包卡死自愈：adb install 超时后 MuMu restart 再装，E2E 实测 6/6
+- Magisk Direct Install 掉桌面可软恢复
+- 【停止任务】/【停止登录】秒级取消（instant-stop-v2，约 0.1s）
+- **不改变**原有业务装包流程
 
-- Windows
-- Python 3.10+
-- 已安装 [MuMu Player](https://www.mumuplayer.com/)
-- 本机 ADB（默认使用 MuMu 自带 `nx_main\adb.exe`）
+完整说明见 [CHANGELOG.md](CHANGELOG.md) 与 [docs/UPDATE_2026-07-31.md](docs/UPDATE_2026-07-31.md)。
 
 ## 快速开始
 
@@ -24,7 +21,7 @@ copy proxies\cocks5.txt.example proxies\cocks5.txt
 copy accounts\input\accounts.example.txt accounts\input\import_active.txt
 ```
 
-1. 小型 APK（NekoBox / Kitsune / Aurora / Venmo splits）已随仓库提供；仅需自行放入 ssets/apk/venmo_bundle/base.apk（约 161MB，超 GitHub 单文件限制）
+1. 小型 APK（NekoBox / Kitsune / Aurora / Venmo splits）已随仓库提供；仅需自行放入 `assets/apk/venmo_bundle/base.apk`（约 161MB，超 GitHub 单文件限制）
 2. 编辑 `proxies\cocks5.txt` 写入 SOCKS5
 3. 编辑 `accounts\input\import_active.txt` 写入账号
 4. 启动：
@@ -39,6 +36,21 @@ start.cmd
 python -B main.py
 ```
 
+## 推荐并行参数
+
+为了「新建几台就几台同时装包」，建议：
+
+```json
+{
+  "create_count": 6,
+  "create_launch_workers": 6,
+  "workers": 6,
+  "stop_force_join_timeout_seconds": 8
+}
+```
+
+`create_launch_workers` 应 **>= create_count**，否则会串行排队，看起来像只有 3~4 台在动。
+
 ## 账号格式
 
 ```text
@@ -48,41 +60,32 @@ python -B main.py
 
 导出分类（默认 `export/classified/`）：
 
-- `correct.txt`
-- `wrong_password.txt`
-- `risk_control.txt`
-- `no_network.txt`
+- correct.txt
+- wrong_password.txt
+- locked.txt
+- captcha_or_review.txt
+- residual.txt
+- other_fail.txt
 
-## 目录结构
+## 目录结构（摘要）
 
-```text
-mumuvenmo/
-  main.py / app_ui.py / paths.py / start.cmd
-  core/                 # 核心逻辑
-  tools/                # 调试与补丁脚本
-  assets/apk/           # 本地 APK（不入库）
-  assets/modules/       # Magisk 模块
-  accounts/             # 账号输入
-  proxies/              # 代理列表
-  export/               # 实时导出
-  logs/                 # 运行日志
-  data/                 # 运行状态
-  screenshots/          # 调试截图
-  docs/                 # 设计说明
-```
+- `app_ui.py` / `main.py`：GUI 与入口
+- `core/`：MuMu / ADB / 装包 / Magisk / 登录 / worker
+- `assets/apk/`：小型 APK 与模块（`base.apk` 需自备）
+- `config.example.json`：配置模板（本地复制为 `config.json`）
+- `proxies/cocks5.txt.example`：代理模板
+- `accounts/input/accounts.example.txt`：账号模板
 
-## 安全说明
+## 安全与仓库约定
 
-本仓库**不包含**：
+**禁止提交：**
 
-- 真实账号/密码
+- 真实 `config.json`
+- 真实账号文件
 - 真实代理凭据
-- 运行日志、截图、导出结果
-- 超大 Venmo ase.apk（需自行准备；其余小型 APK 已随仓库提供）
-
-请勿把含真实凭据的文件提交到 Git。
+- 日志 / 导出结果 / state
+- `assets/apk/venmo_bundle/base.apk`（过大）
 
 ## License
 
-Private use / source snapshot. Third-party APKs and modules remain under their original licenses.
-
+仅供本地授权自动化与自用测试。

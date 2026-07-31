@@ -1,20 +1,20 @@
-﻿C:\Users\zhang\Desktop\mumuvenmo所有的源码日志只能放在这里，不可以再其他目录生产文件。产生的文件在里面创建好文件夹归类好，不要全部都在一个文件夹里。
+C:\Users\zhang\Desktop\mumuvenmo所有的源码日志只能放在这里，不可以再其他目录生产文件。产生的文件在里面创建好文件夹归类好，不要全部都在一个文件夹里。
 
 第一步，mumu模拟器登录器UI界面 带导入账号，带导出账号 实时导出信息。https://www.mumuplayer.com/redirect/nx/aboutus/developer/?lang=en ADB命令。自定义线程启动模拟器进行登录操作。账号自动进行分配，不要多个模拟器登录同一个账号密码。模拟器左上角开始一行排列。如果勾选NekoBox，就打开NekoBox去添加SOCKS5代理。启动NekoBox，Profile Name就用唯一的标识qiang15，chong15等自动进行分配。线程如果超出SOCKS5代理的数量可以重复使用。还有定时重启模拟器功能。SOCKS5刷新链接的规则刷新以后5秒钟以后检测网络连通性，网络没问题才继续启动登录程序。链接3分钟才可以刷新一次不可以频繁刷新。遇到We're having some trouble completing your requestright now. Please try again shortly, and if it persistslet us know.和Something went wrong. Try again.才需要刷新网络。主机直接检测网络连通性，不需要模拟器去检测。
 
 
 第二步，账号格式有两种，一种是账号----密码。一种是账号1----密码----账号2----残号----姓名，	和----都可以识别。两种都是最后面加上获取到的掩码手机号。账号1如果密码不对，就用账号2去登录，密码不变，但是要正确的账号放在账号1，错误的放在账号2。实时导出输出文件。明确成功/失败的账号跳过， 把三种情况输出三个文本分类好。启动NekoBox前要打开NekoBox去添加SOCKS5代理。然后才能启动NekoBox，检测是真实的开启了VPN。打开Kitsune Mask是否已经Install成功。如果没有Uninstall Magisk就是说明需要点Install然后选择Direct Install (modify /systemdirectly) 安装，然后重启模拟器。
 输出例子
-1000000000	ExamplePass1	(3**) ***-**80
-2000000000	ExamplePass2	alt_user@example.com	(***) ***-*612	Example Name	(8**) ***-**12
-1000000000----ExamplePass1----We're having some trouble completing your requestright now. Please try again shortly, and if it persistslet us know.
-2000000000	ExamplePass2	Incorrect login Check your info and try again.
-1000000000----ExamplePass1----Something went wrong. Try again.
+3106343580	Volvo5318	(3**) ***-**80
+8148440612	Nanataty12!	bcustodio88@gmail.com	(***) ***-*612	Belky Marie Custodio Morales	(8**) ***-**12
+3106343580----Volvo5318----We're having some trouble completing your requestright now. Please try again shortly, and if it persistslet us know.
+8148440612	Nanataty12!	Incorrect login Check your info and try again.
+3106343580----Volvo5318----Something went wrong. Try again.
 
 第三步，启动模拟器后优先检查Kitsune Mask安装情况。venmo客户端每次输入账号密码前都要先清除所有数据就像刚安装一样再启动。弹出红框We're having some trouble completing your requestright now. Please try again shortly, and if it persistslet us know.是账号密码正确，但是被风控 没有拿到验证信息。也分类到正确，弹出红框Incorrect login Check your info and try again.就是密码错误。弹出红框Something went wrong. Try again.这个是没网络了。模拟器+cocks5代理+刷新链接启动以后是绑定在一起的，不要乱刷新。NekoBox已经添加过socks5代理就不需要重复添加，直接开启就可以了。刷新链接对应Profile Name的名字。 根据线程数自动排列模拟器位置，电脑左上角开始一行排列，只可以有一行。导入代理前主机先检查代理是否连通，不通就要刷新IP等待5秒钟再检测。没问题了再导入配置。
 
 第四步，停止功能，等待当前正在登录的任务完成，然后关闭模拟器，结束进程。如果直接启动就复用之前的模拟器。勾选启动哪些模拟器。实时输出的文件只有三个固定的文本，数据是叠加的，导入的文本出结果了直接删掉。导出的目录自由选择，启动模拟器后优先检查Kitsune Mask安装情况，没有Uninstall Magisk就是说明需要点Install然后选择Direct Install (modify /systemdirectly)是第三个，不是选择第二个，然后点let'go安装 然后重启。复用模拟器已经勾选了需要安装的APP，缺什么APP就安装什么APP。VPN 授权弹窗未点OK，不停的反复回到桌面，勾选的APP也没有安装。脚本打开的模拟器直接Unable to start the Android Device
-There is currently a conflict, unable to start with administrator privileges. Please exit allemulators and retry, or try to start without administrator privileges.但是手动打开就没问题。按钮排列有问题，小窗口按钮直接就看不到了，要紧凑一点排列。[SharedUID] Shell要自动点击GRANT授权，每次还得人工点。打开Kitsune Mask看到Uninstall Magisk不需要Install。  输出文件怎么是换行？，是要保持原始格式后面加上识别到的红框，TAB或者----。再加上一个删除按钮，选择哪些模拟器 点删除，就可以结束进程然后删除这个模拟器。是打开Kitsune Mask这个APP以后见到Uninstall Magisk不需要点击Install。VPN配置都没有导入进去，然后不停的启动VPN。没发现Direct Install (modify /systemdirectly)就结束Kitsune Mask进程重新打开。打开Kitsune Mask然后点Superuser以后可以看到[SharedUID] Shell选项打开就可以授权了。按钮根据字数调整长度，都看不清全部的字。如果超时就重新登录，一直到出结果，现在遇到掩码的手机号/邮箱 怎么不识别呢 一直 打勾又取消2000000000	ExamplePass2	alt_user@example.com	(***) ***-*612/2000000000----ExamplePass2----alt_user@example.com----(***) ***-*612，1000000000	ExamplePass1	(3**) ***-**80这种格式。
+There is currently a conflict, unable to start with administrator privileges. Please exit allemulators and retry, or try to start without administrator privileges.但是手动打开就没问题。按钮排列有问题，小窗口按钮直接就看不到了，要紧凑一点排列。[SharedUID] Shell要自动点击GRANT授权，每次还得人工点。打开Kitsune Mask看到Uninstall Magisk不需要Install。  输出文件怎么是换行？，是要保持原始格式后面加上识别到的红框，TAB或者----。再加上一个删除按钮，选择哪些模拟器 点删除，就可以结束进程然后删除这个模拟器。是打开Kitsune Mask这个APP以后见到Uninstall Magisk不需要点击Install。VPN配置都没有导入进去，然后不停的启动VPN。没发现Direct Install (modify /systemdirectly)就结束Kitsune Mask进程重新打开。打开Kitsune Mask然后点Superuser以后可以看到[SharedUID] Shell选项打开就可以授权了。按钮根据字数调整长度，都看不清全部的字。如果超时就重新登录，一直到出结果，现在遇到掩码的手机号/邮箱 怎么不识别呢 一直 打勾又取消8148440612	Nanataty12!	bcustodio88@gmail.com	(***) ***-*612/8148440612----Nanataty12!----bcustodio88@gmail.com----(***) ***-*612，3106343580	Volvo5318	(3**) ***-**80这种格式。
 
 遇到e're having some trouble completing your requestright now. Please try again shortly, and if it persistslet us know.和Something went wrong. Try again.刷新对应的链接刷新IP，5秒钟检测网络连通以后再继续。邮箱掩码的问题解决了，手机号掩码还是不全的。怎么还会滑一下到忘记密码/找回密码那里呢。打开Kitsune Mask没有Uninstall Magisk应该点完Install再检查Direct Install (modify /systemdirectly)。找不到才结束进程重新打开。再多一个文本，风控的输出文本，一共四个文本。
 

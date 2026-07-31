@@ -1,3 +1,21 @@
+# 2026-07-31 flash-desktop-recover-v1: Direct/LETS GO 掉桌面软拉回重走，不改步骤
+# 2026-07-31 instant-stop-v2: TaskCancelled+全量可取消sleep，停止秒退
+# 2026-07-31 install-heal-fast-v4: TIMEOUT/NEED_HEAL 跳过 package_installed 空探测，直接 MuMu restart 再装
+# 2026-07-31 install-heal-fast-v3: TIMEOUT/NEED_HEAL 跳过空 adb 重试，直接 MuMu restart 再装
+# 2026-07-31 cancelable-sleep-v1: 长 sleep 可被停止任务打断，不改流程步骤
+# 2026-07-31 package-service-heal-v2: install TIMEOUT/半截/offline 也 MuMu restart 一次再装（不改流程）
+# 2026-07-31 package-service-heal-v1: 装包遇 package 服务挂掉时 MuMu restart 一次再装，不改流程
+# 2026-07-31 lets-go-done-strict-v1: DONE 只认 all done/installation complete，去掉宽泛「完成」误触发
+# 2026-07-31 settings-ih8-truth-v1: settings_done/ih8_done 仅真实成功才置位，失败不写完成缓存
+# 2026-07-31 verify-direct-install-v1: 重启后须 Uninstall 或 magisk binary 才算装上，禁止仅凭 tapped 假成功
+# 2026-07-31 kitsune-reinstall-on-missing-v1: Magisk前若包缺失则ASCII路径重装，不改流程步骤
+# 2026-07-31 store-gate-batch-v3: 门禁 force-stop/disable/home 合并为1次 shell，减 ADB 拥堵
+# 2026-07-31 install-retry-on-timeout-v1: kitsune/nekobox TIMEOUT 后重连再装一次，避免后半段无Kitsune
+# 2026-07-31 only-patch-patience-v1: 仅见Patch多等/多刷新再放弃，减少误杀重开；不改业务流程
+# 2026-07-31 magisk-ui-slot-v2: Magisk UI 槽位 4->10，排队等待每15s打日志，避免10台只见4台后半段
+# 2026-07-31 su-not-desktop-v1: SU弹窗/Kitsune标题不再误判桌面；方法页等第3项时先GRANT不soft_pull
+# 2026-07-31 store-gate-light-v2: 门禁/dismiss 禁止 dumpsys/ui，避免装包卡死
+# 2026-07-31 store-gate-light-v1
 # 2026-07-25 desktop-empty-soft-pull-v1: _wait_third_direct 掉桌面/空dump 软拉回再点Install，避免空等~40s；max_kill不变
 # 2026-07-25 install-tap-reopen-v3: 二次打开必点首页Install；bounds/regex/rid/坐标兜底；仅见Patch长等后再杀
 # 2026-07-25 desktop-no-blind-tap-v1b: drop-to-desktop soft relaunch; no blind Install coords; coord fallback only on Magisk home with Install signal; no attempt force True
@@ -84,6 +102,9 @@
 # update: hide-then-install-v2 - Hide then Install, no double reopen
 from __future__ import annotations
 
+# 2026-07-31 concurrent-provision-v1: 10路同步装包缩短 force-stop/批量杀进程/START 日志
+# 2026-07-31 heavy-install-v1: Magisk UI 调用点全局限 4 路
+
 import json
 import re
 import xml.etree.ElementTree as ET
@@ -101,7 +122,16 @@ logger = logging.getLogger("mumuvenmo")
 LogFn = Optional[Callable[[str], None]]
 
 
+class TaskCancelled(BaseException):
+    """用户点【停止任务】时抛出。
+
+    继承 BaseException，避免被业务里大量 bare `except Exception` 吞掉，
+    从而让装包/Magisk 循环在停止后立刻向上退出。不改变正常业务流程。
+    """
+
+
 class RootSetup:
+    _magisk_ui_sema = __import__('threading').Semaphore(10)  # magisk-ui-slot-v2
     def __init__(
         self,
         mumu: MuMuManager,
@@ -131,9 +161,45 @@ class RootSetup:
         except Exception:
             return False
 
+    def _raise_if_cancelled(self, where: str = "") -> None:
+        if self._cancelled():
+            raise TaskCancelled(f"task_cancelled:{where}" if where else "task_cancelled")
+
+    def _sleep_cancelable(self, seconds: float, slice_sec: float = 0.15) -> bool:
+        """可被停止任务打断的 sleep。取消时抛 TaskCancelled；正常返回 False。"""
+        try:
+            total = float(seconds or 0)
+        except Exception:
+            total = 0.0
+        if self._cancelled():
+            raise TaskCancelled("task_cancelled:sleep")
+        if total <= 0:
+            return False
+        try:
+            step = float(slice_sec or 0.15)
+        except Exception:
+            step = 0.15
+        if step < 0.05:
+            step = 0.05
+        if step > 0.25:
+            step = 0.25
+        end = time.time() + total
+        while time.time() < end:
+            if self._cancelled():
+                raise TaskCancelled("task_cancelled:sleep")
+            remain = end - time.time()
+            if remain <= 0:
+                break
+            time.sleep(min(step, remain))
+        if self._cancelled():
+            raise TaskCancelled("task_cancelled:sleep")
+        return False
+
+
     def _log(self, log: LogFn, msg: str) -> None:
+        # 只走 logger；UiLogBridge 会进 UI。避免 log()->app._log->logger.info 双写文件
         logger.info(msg)
-        if log:
+        if log and getattr(log, "_mumu_direct_ui", False):
             try:
                 log(msg)
             except Exception:
@@ -178,15 +244,28 @@ class RootSetup:
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def is_kitsune_settings_done(self, vmindex: int) -> bool:
+        """仅认真实三项全开；拒绝 flags= 宽松假阳性 / done=...False。"""
         p = self.kitsune_state_path(vmindex)
         if not p.exists():
             return False
         try:
             data = json.loads(p.read_text(encoding="utf-8")) or {}
-            if bool(data.get("settings_ok")):
-                return True
             detail = str(data.get("detail") or "")
-            return ("flags=" in detail) and ("flags=skipped_login_only" not in detail)
+            # done= 行若含 False，直接否（即使 settings_ok 被旧逻辑误写 True）
+            m = re.search(r"done=([^|]+)", detail)
+            if m and "False" in m.group(1):
+                return False
+            if self._settings_flags_all_on(detail):
+                return True
+            if bool(data.get("settings_ok")) and "Zygisk:False" not in detail and "MagiskHide:False" not in detail:
+                # 旧成功缓存无 done= 行时，settings_ok=True 且无 False 痕迹才认
+                if "settings_ok" in detail or "all_three_on" in detail or "Zygisk=on" in detail or "Zygisk:True" in detail:
+                    return True
+                # 仅 settings_ok 字段、detail 含失败 ih8/无 uninstall 时不轻信
+                if "install_storage_miss" in detail or "soft_tap_verify_fail" in detail:
+                    return False
+                return True
+            return False
         except Exception:
             return False
 
@@ -219,9 +298,10 @@ class RootSetup:
 
     def _focused_package(self) -> str:
         try:
+            # 高并发下 dumpsys 极易卡死；门禁/dismiss 必须短超时
             out = self.adb.shell(
-                "dumpsys", "window", "windows", timeout=12
-            ) or self.adb.shell("dumpsys", "window", timeout=12) or ""
+                "dumpsys", "window", "windows", timeout=3
+            ) or ""
         except Exception:
             out = ""
         for pat in (
@@ -270,151 +350,118 @@ class RootSetup:
         )
         return any(k in low for k in busy)
 
+
+    def _force_stop_pkgs(self, pkgs: list[str], timeout: int = 3) -> str:
+        """一次 shell 批量 force-stop，减少 10 路并行时的 adb 往返。"""
+        names = [p for p in pkgs if p]
+        if not names:
+            return "empty"
+        script = "; ".join(f"am force-stop {p} 2>/dev/null" for p in names) + "; echo FS_OK"
+        try:
+            out = self.adb.shell("sh", "-c", script, timeout=max(3, int(timeout) + len(names))) or ""
+            return "ok" if "FS_OK" in out or out.strip() else (out.strip()[:80] or "ok")
+        except Exception:
+            notes = []
+            for p in names:
+                try:
+                    self.adb.shell("am", "force-stop", p, timeout=3)
+                    notes.append(p.split(".")[-1])
+                except Exception as e2:
+                    notes.append(f"err:{e2}")
+            return "|".join(notes)[:120]
+
     def dismiss_mumu_store(self, log: LogFn = None, times: int = 1) -> str:
-        """强制结束 MuMu Store 并回桌面，避免抢焦点干扰 Kitsune/NekoBox。"""
+        """强制结束 MuMu Store 并回桌面（light，无 dumpsys/ui dump）。"""
         notes = []
-        for i in range(max(1, times)):
+        pkg = self.MUMU_STORE_PKG
+        for i in range(max(1, min(int(times or 1), 2))):
+            if self._cancelled():
+                notes.append("cancelled")
+                break
+            # store-gate-batch-v3: 一次 shell 完成 force-stop+disable+HOME，少占 ADB 槽
+            script = (
+                f"am force-stop {pkg} 2>/dev/null; "
+                f"pm disable-user --user 0 {pkg}/.MainActivity 2>/dev/null; "
+                f"input keyevent 3; echo DS_OK"
+            )
             try:
-                self.adb.shell("am", "force-stop", self.MUMU_STORE_PKG, timeout=12)
-                notes.append("force-stop")
+                out = self.adb.shell("sh", "-c", script, timeout=5) or ""
+                notes.append("batch-fs" if "DS_OK" in out or out.strip() else "batch-try")
             except Exception as exc:
-                notes.append(f"fs_err={exc}")
-            try:
-                # 禁掉自启组件（失败忽略）
-                self.adb.shell(
-                    "pm", "disable-user", "--user", "0",
-                    f"{self.MUMU_STORE_PKG}/.MainActivity",
-                    timeout=12,
-                )
-            except Exception:
-                pass
-            try:
-                self.adb.shell("input", "keyevent", "3", timeout=8)
-                notes.append("home")
-            except Exception:
-                pass
-            time.sleep(0.8)
-            pkg = self._focused_package()
-            if pkg and pkg != self.MUMU_STORE_PKG and "mumu.store" not in pkg:
-                break
-            try:
-                ui = (self.adb.ui_full_text() or "").lower()
-            except Exception:
-                ui = ""
-            if not self._ui_looks_like_mumu_store(ui):
-                break
-        self._log(log, f"dismiss MuMu Store: {';'.join(notes)[:160]} focus={self._focused_package()}")
+                notes.append(f"batch_err={exc}")
+            end = time.time() + 0.25
+            while time.time() < end:
+                if self._cancelled():
+                    break
+                self._sleep_cancelable(0.05)
+        self._log(log, f"dismiss MuMu Store: {'|'.join(notes)[:160]} light=1")
         return "|".join(notes)[:200]
 
     def wait_mumu_store_sync(
         self,
         *,
         log: LogFn = None,
-        timeout: int = 180,
-        idle_stable_seconds: float = 8.0,
+        timeout: int = 20,
+        idle_stable_seconds: float = 2.0,
         force_close_after: bool = True,
     ) -> str:
-        """新建模拟器首启门禁（用户指定顺序）：
+        """新建模拟器首启超轻量门禁（store-gate-batch-v3）。
 
-        1) 先结束 MuMu Store 进程（force-stop）
-        2) 同时/随后等待系统同步安装 APP 完成（package installer / 忙碌 UI 结束）
-        3) 期间若弹 Magisk su：Remember choice forever → Allow
-        4) 结束后再强制关掉商店，避免抢焦点
+        绝对禁止 dumpsys/uiautomator/pm sessions。
+        force-stop+disable+HOME 合并为 1 次 shell，避免 10 路并行时 3s 超时风暴堵死装包。
         """
         import time as _t
 
-        # 1) 先结束 MuMu Store 进程
-        self._log(log, "MuMu Store: 先 force-stop 结束进程")
-        try:
-            self.adb.shell("am", "force-stop", self.MUMU_STORE_PKG, timeout=12)
-        except Exception as exc:
-            self._log(log, f"MuMu Store force-stop err: {exc}")
-        try:
-            self.adb.shell("input", "keyevent", "3", timeout=8)
-        except Exception:
-            pass
-        time.sleep(1.0)
-
+        hard_timeout = max(3, min(int(timeout or 12), 12))
         t0 = _t.time()
-        idle_since = None
-        last = ""
-        saw_busy = False
-        while _t.time() - t0 < max(20, int(timeout)):
+        self._log(log, f"MuMu Store: 超轻量门禁 start timeout={hard_timeout}s no-dumpsys batch=1")
+        if self._cancelled():
+            return "cancelled"
+
+        notes = []
+        pkg = self.MUMU_STORE_PKG
+        # 两轮合并 shell，每轮最多 5s，不再 3 命令 x 3s 串行超时
+        for i in range(2):
             if self._cancelled():
                 return "cancelled"
-
-            # 商店若又被拉起，立即再杀
-            pkg = self._focused_package()
-            if pkg and "mumu.store" in pkg:
-                try:
-                    self.adb.shell("am", "force-stop", self.MUMU_STORE_PKG, timeout=12)
-                    self.adb.shell("input", "keyevent", "3", timeout=8)
-                    self._log(log, "MuMu Store 再次被拉起 → force-stop")
-                except Exception:
-                    pass
-
+            script = (
+                f"am force-stop {pkg} 2>/dev/null; "
+                f"pm disable-user --user 0 {pkg}/.MainActivity 2>/dev/null; "
+                f"input keyevent 3; echo GATE_OK"
+            )
             try:
-                ui = self.adb.ui_full_text() or ""
-            except Exception:
-                ui = ""
-            low = ui.lower()
-            busy = self._mumu_store_busy_ui(low)
-            if pkg and (
-                "packageinstaller" in (pkg or "")
-                or "com.android.packageinstaller" in (pkg or "")
-                or "com.google.android.packageinstaller" in (pkg or "")
-            ):
-                busy = True
-            # 轻量检测安装会话（禁止 dumpsys package install，体积过大且易误判/拖死）
+                out = self.adb.shell("sh", "-c", script, timeout=5) or ""
+                if "GATE_OK" in out:
+                    notes.append("batch-ok")
+                else:
+                    notes.append("batch-try")
+            except Exception as exc:
+                notes.append(f"batch_err={exc}")
+            end = _t.time() + (0.5 if i == 0 else 0.3)
+            while _t.time() < end:
+                if self._cancelled():
+                    return "cancelled"
+                _t.sleep(0.1)
+            if _t.time() - t0 >= hard_timeout:
+                break
+
+        detail = (
+            f"saw_busy=False elapsed={int(_t.time()-t0)}s "
+            f"notes={'|'.join(notes)[:120]} light=3"
+        )
+        if force_close_after and not self._cancelled():
             try:
-                sess = (self.adb.shell("pm", "list", "sessions", timeout=8) or "").lower()
-            except Exception:
-                sess = ""
-            if sess and any(k in sess for k in ("session", "active", "install")) and "no sessions" not in sess:
-                # 仅当输出像真实会话列表时 busy
-                if re.search(r"session\s*id|install\s*session|isactive\s*=\s*true", sess):
-                    busy = True
-
-            # Magisk su：Remember forever → Allow
-            try:
-                hit = self.adb.dismiss_magisk_su_dialog()
-                if hit:
-                    self._log(log, f"MuMu Store wait 期间 su 授权: {hit}")
-            except Exception:
-                pass
-
-            if busy:
-                saw_busy = True
-                idle_since = None
-            else:
-                if idle_since is None:
-                    idle_since = _t.time()
-                elif _t.time() - idle_since >= idle_stable_seconds:
-                    break
-
-            status = f"pkg={pkg or '-'} busy={busy} saw_busy={saw_busy}"
-            if status != last:
-                self._log(log, f"APP sync wait: {status} ui={(ui or '')[:80]!r}")
-                last = status
-            _t.sleep(0.9 if busy else 0.6)
-
-        detail = f"saw_busy={saw_busy} elapsed={int(_t.time()-t0)}s last={last}"
-        if force_close_after:
-            d = self.dismiss_mumu_store(log=log, times=1)
-            detail += f" dismiss={d}"
-        # 再清一次可能残留的 su 弹窗
-        try:
-            hit = self.adb.dismiss_magisk_su_dialog()
-            if hit:
-                detail += f" su={hit}"
-                self._log(log, f"门禁结束前 su 授权: {hit}")
-        except Exception:
-            pass
+                script = (
+                    f"am force-stop {pkg} 2>/dev/null; "
+                    f"input keyevent 3; echo DS_OK"
+                )
+                self.adb.shell("sh", "-c", script, timeout=4)
+                detail += " dismiss=batch-fs"
+            except Exception as exc:
+                detail += f" dismiss_err={exc}"
         self._log(log, f"MuMu Store/APP sync gate done: {detail}")
         return detail
 
-
-    # ------------------------------------------------------------------ packages
     def ensure_packages(
         self,
         vmindex: int,
@@ -436,30 +483,159 @@ class RootSetup:
 
         def _install_one(kind: str, pkg: str, apk: Path) -> str:
             try:
+                if self._cancelled():
+                    return "adb_cancelled"
                 if self.adb.package_installed(pkg):
                     return "already_installed"
                 if not apk.exists():
                     return "missing_apk"
                 self._log(log, f"VM={vmindex} 安装 {kind}: {apk.name}")
                 logger.info("安装 %s: %s", kind, apk.name)
-                # 同 VM 串行：先 adb（稳定），失败再 MuMu manager
-                out = ""
+                # 中文/非ASCII 文件名在高并发 adb install 下易失败 → ASCII 临时副本
+                install_apk = apk
+                ascii_tmp = None
                 try:
-                    out2 = self.adb.install(apk)
-                    out = str(out2)
+                    if any(ord(ch) > 127 for ch in str(apk.name)):
+                        import os as _os
+                        import shutil
+                        import tempfile
+                        ext = apk.suffix or ".apk"
+                        fd, tmp_path = tempfile.mkstemp(prefix=f"mumu_{kind}_", suffix=ext)
+                        _os.close(fd)
+                        shutil.copy2(str(apk), tmp_path)
+                        ascii_tmp = Path(tmp_path)
+                        install_apk = ascii_tmp
+                        self._log(log, f"VM={vmindex} 安装 {kind}: ASCII临时={ascii_tmp.name}")
                 except Exception as exc:
-                    out = f"adb_err:{exc}"
-                if self.adb.package_installed(pkg):
-                    return (out.strip()[:200] or "installed_ok_adb")
+                    self._log(log, f"VM={vmindex} 安装 {kind}: ASCII临时失败 fallback err={exc}")
+                    install_apk = apk
+                    ascii_tmp = None
                 try:
-                    cp = self.mumu.install_apk(vmindex, apk)
-                    out_m = ((cp.stdout or "") + (cp.stderr or "")).strip()
-                    out = (out + "\n" + out_m).strip()
-                except Exception as exc:
-                    out = (out + f"\nmumu_err:{exc}").strip()
-                if self.adb.package_installed(pkg):
-                    return (out.strip()[:200] or "installed_ok_mumu")
-                return (out.strip()[:300] or "install_failed")
+                    # 同 VM 串行：先 adb（稳定），失败再 MuMu manager
+                    out = ""
+                    try:
+                        out2 = self.adb.install(install_apk)
+                        out = str(out2)
+                    except Exception as exc:
+                        out = f"adb_err:{exc}"
+                    # install-heal-fast-v4: 安装输出已明确 TIMEOUT/NEED_HEAL 时，
+                    # 跳过 package_installed 的多次 pm path/list（高并发下可空耗 40s+），直接 MuMu heal。
+                    low = (out or "").lower()
+                    need_heal_now = any(
+                        k in low
+                        for k in (
+                            "need_package_service_heal",
+                            "timeout",
+                            "adb_heavy_sema_timeout",
+                            "find service: package",
+                            "broken pipe",
+                            "error: closed",
+                            "can't find service: package",
+                            "cannot find service: package",
+                        )
+                    )
+                    if (not need_heal_now) and self.adb.package_installed(pkg):
+                        return (out.strip()[:200] or "installed_ok_adb")
+                    # offline 且 package 仍活着：可轻量重试一次
+                    if (not need_heal_now) and any(
+                        k in low
+                        for k in (
+                            "device offline",
+                            "device not found",
+                            "performing streamed install",
+                            "failed to install",
+                            "connection reset",
+                        )
+                    ):
+                        try:
+                            self.adb.connect()
+                        except Exception:
+                            pass
+                        self._sleep_cancelable(1.5)
+                        if self._cancelled():
+                            return "adb_cancelled"
+                        self._log(log, f"VM={vmindex} 安装 {kind} 首次失败后重试: {out.strip()[:80]!r}")
+                        try:
+                            out3 = self.adb.install(install_apk)
+                            out = (out + "\nretry:" + str(out3)).strip()
+                        except Exception as exc:
+                            out = (out + f"\nretry_err:{exc}").strip()
+                        if self.adb.package_installed(pkg):
+                            return (out.strip()[:200] or "installed_ok_adb_retry")
+                        low = (out or "").lower()
+                    # package-service-heal-v2+v3: package 服务挂/install TIMEOUT/半截 时 MuMu restart 一次再装（不改装包顺序）
+                    low2 = (out or "").lower()
+                    pkg_dead = need_heal_now or any(
+                        k in low2
+                        for k in (
+                            "need_package_service_heal",
+                            "find service: package",
+                            "broken pipe",
+                            "error: closed",
+                            "can't find service: package",
+                            "cannot find service: package",
+                            "timeout",
+                            "adb_heavy_sema_timeout",
+                            "performing streamed install",
+                            "device offline",
+                            "device not found",
+                            "connection reset",
+                        )
+                    )
+                    # 安装输出无明确关键字，但 package 服务已挂：也 heal
+                    if not pkg_dead:
+                        try:
+                            if hasattr(self.adb, "package_service_alive") and not self.adb.package_service_alive():
+                                pkg_dead = True
+                                low2 = (low2 + " service_check_dead").strip()
+                        except Exception:
+                            pass
+                    if pkg_dead:
+                        if self._cancelled():
+                            return "adb_cancelled"
+                        self._log(
+                            log,
+                            f"VM={vmindex} 安装 {kind}: 检测到 package 服务异常，MuMu restart 后重装",
+                        )
+                        try:
+                            rr = self.restart_vm_and_wait(
+                                vmindex,
+                                log=log,
+                                boot_timeout=180,
+                                reason=f"package-service-heal:{kind}",
+                            )
+                            self._log(log, f"VM={vmindex} package-service-heal restart={rr}")
+                        except Exception as exc:
+                            self._log(log, f"VM={vmindex} package-service-heal restart err={exc}")
+                        if self._cancelled():
+                            return "adb_cancelled"
+                        try:
+                            self.adb.connect()
+                        except Exception:
+                            pass
+                        self._sleep_cancelable(1.0)
+                        try:
+                            out4 = self.adb.install(install_apk)
+                            out = (out + "\nheal:" + str(out4)).strip()
+                        except Exception as exc:
+                            out = (out + f"\nheal_err:{exc}").strip()
+                        if self.adb.package_installed(pkg):
+                            return (out.strip()[:200] or "installed_ok_adb_heal")
+                    try:
+                        cp = self.mumu.install_apk(vmindex, apk)
+                        out_m = ((cp.stdout or "") + (cp.stderr or "")).strip()
+                        out = (out + "\n" + out_m).strip()
+                    except Exception as exc:
+                        out = (out + f"\nmumu_err:{exc}").strip()
+                    if self.adb.package_installed(pkg):
+                        return (out.strip()[:200] or "installed_ok_mumu")
+                    return (out.strip()[:300] or "install_failed")
+                finally:
+                    if ascii_tmp is not None:
+                        try:
+                            ascii_tmp.unlink(missing_ok=True)
+                        except Exception:
+                            pass
             except Exception as exc:
                 return f"err:{exc}"[:200]
 
@@ -486,6 +662,13 @@ class RootSetup:
             result["aurora"] = "skipped_by_ui"
 
         for kind, pkg, apk in jobs:
+            if self._cancelled():
+                result[kind] = "adb_cancelled"
+                self._log(log, f"VM={vmindex} 装包 {kind}=adb_cancelled")
+                for kind2, _, _ in jobs:
+                    if kind2 not in result:
+                        result[kind2] = "adb_cancelled"
+                break
             msg = _install_one(kind, pkg, apk)
             result[kind] = msg
             self._log(log, f"VM={vmindex} 装包 {kind}={str(msg)[:120]}")
@@ -540,14 +723,13 @@ class RootSetup:
             notes.append("pushed")
         except Exception as exc:
             notes.append(f"push_fail:{exc}")
-        for pkg in ("com.android.documentsui", "com.google.android.documentsui"):
-            try:
-                self.adb.shell("am", "force-stop", pkg, timeout=10)
-            except Exception:
-                pass
+        try:
+            self._force_stop_pkgs(["com.android.documentsui", "com.google.android.documentsui"], timeout=3)
+        except Exception:
+            pass
         try:
             self.open_kitsune(force_relaunch=not reuse_session)
-            time.sleep(0.5 if reuse_session else 0.9)
+            self._sleep_cancelable(0.5 if reuse_session else 0.9)
             if reuse_session:
                 notes.append("reuse_session")
         except Exception as exc:
@@ -626,7 +808,7 @@ class RootSetup:
             notes.append("modules_coord")
         else:
             notes.append("modules_tap")
-        time.sleep(1.1)
+        self._sleep_cancelable(1.1)
         xml = _dump()
 
         if _module_present(xml) and _module_enabled(xml):
@@ -634,17 +816,64 @@ class RootSetup:
             self._log(log, "ih8 UI: already installed and enabled")
             return "ok_already:" + "|".join(notes)[:200]
 
-        if not _tap_exact_text(xml, "Install from storage"):
+        storage_tapped = False
+        if _tap_exact_text(xml, "Install from storage"):
+            notes.append("install_storage_tap")
+            storage_tapped = True
+        else:
             b = self.adb.find_node_bounds(text_substr="Install from storage", xml=xml)
             if b:
                 self.adb.tap_bounds(b)
                 notes.append("install_storage_sub")
-            else:
-                notes.append("install_storage_miss")
-                return "no_install_from_storage|" + "|".join(notes)
-        else:
-            notes.append("install_storage_tap")
-        time.sleep(1.4)
+                storage_tapped = True
+        if not storage_tapped:
+            # 重试：上滑/下滑 + 常见 FAB/菜单文案（不改流程，只提高命中）
+            for retry in range(3):
+                try:
+                    if retry == 0:
+                        self.adb.shell("input", "swipe", "720", "900", "720", "1600", "180", timeout=6)
+                    else:
+                        self.adb.shell("input", "swipe", "720", "1800", "720", "900", "180", timeout=6)
+                except Exception:
+                    pass
+                self._sleep_cancelable(0.45)
+                xml = _dump()
+                if _tap_exact_text(xml, "Install from storage"):
+                    notes.append(f"install_storage_tap_r{retry}")
+                    storage_tapped = True
+                    break
+                b = self.adb.find_node_bounds(text_substr="Install from storage", xml=xml)
+                if b:
+                    self.adb.tap_bounds(b)
+                    notes.append(f"install_storage_sub_r{retry}")
+                    storage_tapped = True
+                    break
+                for alt in ("从本地安装", "从存储安装", "Select from storage", "Install from local"):
+                    if _tap_exact_text(xml, alt) or self.adb.tap_text(alt):
+                        notes.append(f"install_storage_alt={alt}")
+                        storage_tapped = True
+                        break
+                if storage_tapped:
+                    break
+                # Magisk/Kitsune 右下角 FAB 常见坐标兜底
+                try:
+                    self.adb.tap(1260, 2200)
+                    notes.append(f"install_storage_fab_r{retry}")
+                    self._sleep_cancelable(0.7)
+                    xml = _dump()
+                    if "ih8" in xml.lower() or "download" in xml.lower() or "zip" in xml.lower() or "files" in xml.lower():
+                        storage_tapped = True
+                        break
+                    if _tap_exact_text(xml, "Install from storage"):
+                        storage_tapped = True
+                        notes.append("install_storage_after_fab")
+                        break
+                except Exception:
+                    pass
+        if not storage_tapped:
+            notes.append("install_storage_miss")
+            return "no_install_from_storage|" + "|".join(notes)
+        self._sleep_cancelable(1.4)
         xml = _dump()
 
         picked = False
@@ -665,12 +894,12 @@ class RootSetup:
             if b:
                 self.adb.tap_bounds(b)
                 notes.append("show_roots")
-                time.sleep(0.8)
+                self._sleep_cancelable(0.8)
                 xml = _dump()
                 for root_name in ("Downloads", "Download", "MuMu shared", "Internal storage"):
                     if _tap_exact_text(xml, root_name) or self.adb.tap_text(root_name):
                         notes.append(f"root={root_name}")
-                        time.sleep(1.0)
+                        self._sleep_cancelable(1.0)
                         xml = _dump()
                         break
             m = re.search(
@@ -693,13 +922,13 @@ class RootSetup:
 
         installed = False
         for i in range(24):
-            time.sleep(1.0)
+            self._sleep_cancelable(1.0)
             xml = _dump()
             low = xml.lower()
             for btn in ("OK", "Done", "Close"):
                 if _tap_exact_text(xml, btn):
                     notes.append(f"btn={btn}")
-                    time.sleep(0.5)
+                    self._sleep_cancelable(0.5)
                     xml = _dump()
                     break
             if _module_present(xml):
@@ -724,7 +953,7 @@ class RootSetup:
                             if 'checked="false"' in na:
                                 self.adb.tap((x1 + x2) // 2, cy)
                                 notes.append("enabled_switch")
-                                time.sleep(0.5)
+                                self._sleep_cancelable(0.5)
                             break
                 installed = True
                 notes.append("list_ok")
@@ -748,10 +977,10 @@ class RootSetup:
                     self.open_kitsune(force_relaunch=False)
                 except Exception:
                     pass
-                time.sleep(0.8)
+                self._sleep_cancelable(0.8)
                 xml = _dump()
                 _tap_exact_text(xml, "Modules", y_min=2100)
-                time.sleep(1.0)
+                self._sleep_cancelable(1.0)
 
         try:
             ls = self.adb.shell_su("ls /data/adb/modules 2>/dev/null", timeout=15) or ""
@@ -776,6 +1005,26 @@ class RootSetup:
         # ok_ui / ok_cli / ok_cli_banner / ok_dir 等新装路径
         return True
 
+    def _settings_flags_all_on(self, flags: str) -> bool:
+        """仅当 Zygisk/MagiskHide/Enforce SuList 三项真实为 on 才算 settings 完成。"""
+        s = str(flags or "")
+        if "all_three_on" in s:
+            return True
+        m = re.search(r"done=([^|]+)", s)
+        if not m:
+            return False
+        part = m.group(1)
+        return (
+            "Zygisk:True" in part
+            and "MagiskHide:True" in part
+            and "Enforce SuList:True" in part
+        )
+
+    def _ih8_result_ok(self, result: str) -> bool:
+        """ih8 真实成功（UI/CLI/目录），失败串不能当 done。"""
+        s = str(result or "").strip().lower()
+        return s.startswith("ok")
+
     def restart_vm_and_wait(
         self,
         vmindex: int,
@@ -799,7 +1048,7 @@ class RootSetup:
             return f"err:{exc}"
 
         # 给进程退出一点时间，再轮询 boot
-        time.sleep(6.0)
+        self._sleep_cancelable(6.0)
         deadline = time.time() + max(90, int(boot_timeout or 180))
         last_err = ""
         while time.time() < deadline:
@@ -819,7 +1068,7 @@ class RootSetup:
                         return "ok"
             except Exception as exc:
                 last_err = str(exc)[:120]
-            time.sleep(3)
+            self._sleep_cancelable(3)
         self._log(log, f"{tag} restart 后等待超时 last={last_err}")
         return f"timeout:{last_err}" if last_err else "timeout"
 
@@ -971,7 +1220,7 @@ class RootSetup:
             else:
                 outs.append(f"mid{attempt+1}=no_popup")
                 self._log(log, f"Shell GRANT: 未见弹窗，不点击，准备重试发起 su")
-            time.sleep(0.35)
+            self._sleep_cancelable(0.35)
 
         # 仅残留弹窗可见时再处理一次
         try:
@@ -1137,7 +1386,7 @@ class RootSetup:
             if shell_y is not None:
                 cx, cy = 1216, shell_y
                 self.adb.tap(cx, cy)
-                time.sleep(0.8)
+                self._sleep_cancelable(0.8)
                 return f"fallback_right_tap center=({cx},{cy})"
             return "no_switch"
 
@@ -1156,14 +1405,14 @@ class RootSetup:
         if checked == "true":
             return f"already_on center=({cx},{cy}) bounds=[{x1},{y1}][{x2},{y2}] rid={rid}"
         self.adb.tap(cx, cy)
-        time.sleep(0.9)
+        self._sleep_cancelable(0.9)
         # 复查
         xml2 = self.adb.uiautomator_dump(force=True) or ""
         if 'policy_indicator' in xml2 and 'checked="true"' in xml2:
             return f"toggled_on_ok center=({cx},{cy}) bounds=[{x1},{y1}][{x2},{y2}]"
         # 再点一次
         self.adb.tap(cx, cy)
-        time.sleep(0.7)
+        self._sleep_cancelable(0.7)
         return f"toggled_on center=({cx},{cy}) bounds=[{x1},{y1}][{x2},{y2}] rid={rid}"
 
     def grant_shell_via_kitsune_superuser(self, log: LogFn = None, reuse_session: bool = False) -> str:
@@ -1180,14 +1429,14 @@ class RootSetup:
                     self.adb.force_stop(pkg)
                 except Exception:
                     pass
-                time.sleep(0.25)
+                self._sleep_cancelable(0.25)
                 try:
                     self.adb.shell("input", "keyevent", "3", timeout=5)
                 except Exception:
                     pass
-                time.sleep(0.2)
+                self._sleep_cancelable(0.2)
                 self.open_kitsune(force_relaunch=True)
-                time.sleep(0.55)
+                self._sleep_cancelable(0.55)
                 steps.append("opened")
             else:
                 # 见 Uninstall Magisk 后同会话直接授权：不 force-stop、尽量不重开
@@ -1203,7 +1452,7 @@ class RootSetup:
                     steps.append("reuse_same_session_no_reopen")
                 else:
                     self.open_kitsune(force_relaunch=False)
-                    time.sleep(0.3)
+                    self._sleep_cancelable(0.3)
                     steps.append("reuse_opened")
 
             super_labels = ("Superuser", "超级用户", "超级权限", "授权", "SU")
@@ -1225,7 +1474,7 @@ class RootSetup:
                 if hit:
                     steps.append(f"tab={hit}")
                     tapped_tab = True
-                    time.sleep(0.4)
+                    self._sleep_cancelable(0.4)
                     break
                 # 底部导航兜底
                 for x in (360, 540, 720, 900):
@@ -1233,8 +1482,8 @@ class RootSetup:
                         self.adb.tap(x, 2480)
                     except Exception:
                         pass
-                    time.sleep(0.08)
-                time.sleep(0.2)
+                    self._sleep_cancelable(0.08)
+                self._sleep_cancelable(0.2)
 
             if not tapped_tab:
                 steps.append("tab_miss")
@@ -1253,7 +1502,7 @@ class RootSetup:
                     switched = True
                     if sw.startswith("already_on"):
                         break
-                    time.sleep(0.5)
+                    self._sleep_cancelable(0.5)
                     # 确认 checked
                     xml3 = self.adb.uiautomator_dump(force=True) or ""
                     if 'policy_indicator' in xml3 and re.search(
@@ -1270,7 +1519,7 @@ class RootSetup:
                     self.adb.shell("input", "swipe", "720", "1800", "720", "900", "300", timeout=8)
                 except Exception:
                     pass
-                time.sleep(0.5)
+                self._sleep_cancelable(0.5)
 
             if not switched:
                 steps.append("switch_miss_try_detail")
@@ -1281,7 +1530,7 @@ class RootSetup:
                     if b:
                         self.adb.tap_bounds(b)
                         steps.append(f"row_detail={key}")
-                        time.sleep(0.9)
+                        self._sleep_cancelable(0.9)
                         break
                 xml2 = self.adb.uiautomator_dump(force=True) or ""
                 for lab in ("Forever", "永久", "Always", "始终"):
@@ -1289,7 +1538,7 @@ class RootSetup:
                     if b:
                         self.adb.tap_bounds(b)
                         steps.append(f"dur={lab}")
-                        time.sleep(0.35)
+                        self._sleep_cancelable(0.35)
                         xml2 = self.adb.uiautomator_dump(force=True) or ""
                         break
                 allow_hit = self.adb.tap_any(
@@ -1313,7 +1562,7 @@ class RootSetup:
             if reuse_session:
                 steps.append("keep_session_no_force_stop")
                 return "|".join(steps)
-            time.sleep(0.25)
+            self._sleep_cancelable(0.25)
             try:
                 self._force_stop_kitsune_home()
             except Exception:
@@ -1333,7 +1582,7 @@ class RootSetup:
         notes: list[str] = []
         try:
             self.open_kitsune(force_relaunch=not reuse_session)
-            time.sleep(0.25 if reuse_session else 0.45)
+            self._sleep_cancelable(0.25 if reuse_session else 0.45)
             if reuse_session:
                 notes.append("reuse_session")
         except Exception as exc:
@@ -1351,7 +1600,7 @@ class RootSetup:
         else:
             self.adb.tap_bounds(b)
             notes.append("settings_tap")
-        time.sleep(0.45)
+        self._sleep_cancelable(0.45)
         # 仅当看到文件选择器时才清理，避免每次 force-stop 拖慢
         try:
             xml_pre = self.adb.uiautomator_dump(force=True) or ""
@@ -1360,10 +1609,10 @@ class RootSetup:
         if any(k in (xml_pre or "").lower() for k in ("documentsui", "open from", "downloads", "recent")):
             for pkg in ("com.android.documentsui", "com.google.android.documentsui"):
                 try:
-                    self.adb.shell("am", "force-stop", pkg, timeout=6)
+                    self.adb.shell("am", "force-stop", pkg, timeout=3)
                 except Exception:
                     pass
-            time.sleep(0.2)
+            self._sleep_cancelable(0.2)
             try:
                 xml_pre = self.adb.uiautomator_dump(force=True) or ""
             except Exception:
@@ -1379,9 +1628,9 @@ class RootSetup:
                         self.adb.shell("input", "keyevent", "4", timeout=5)
                     except Exception:
                         pass
-                    time.sleep(0.2)
+                    self._sleep_cancelable(0.2)
                 self.open_kitsune(force_relaunch=not bool(reuse_session))
-                time.sleep(0.4)
+                self._sleep_cancelable(0.4)
                 xml2 = self.adb.uiautomator_dump(force=True) or ""
                 b2 = self.adb.find_node_bounds(content_desc="Settings", xml=xml2) or self.adb.find_node_bounds(
                     resource_id="action_settings", xml=xml2
@@ -1390,7 +1639,7 @@ class RootSetup:
                     self.adb.tap_bounds(b2)
                 else:
                     self.adb.tap(1344, 208)
-                time.sleep(0.45)
+                self._sleep_cancelable(0.45)
             except Exception as exc:
                 notes.append(f"settings_retry_err={exc}")
 
@@ -1442,7 +1691,7 @@ class RootSetup:
                     self.adb.shell("input", "keyevent", "4", timeout=5)
                 except Exception:
                     pass
-                time.sleep(0.6)
+                self._sleep_cancelable(0.6)
                 return
             for label in targets:
                 if done[label]:
@@ -1475,7 +1724,7 @@ class RootSetup:
                     break
                 if not best:
                     self.adb.tap(1216, y)
-                    time.sleep(0.28)
+                    self._sleep_cancelable(0.28)
                     notes.append(f"{label}=right_tap")
                     done[label] = True
                     continue
@@ -1485,7 +1734,7 @@ class RootSetup:
                     done[label] = True
                 else:
                     self.adb.tap(cx, cy)
-                    time.sleep(0.32)
+                    self._sleep_cancelable(0.32)
                     notes.append(f"{label}=on")
                     done[label] = True
 
@@ -1509,7 +1758,7 @@ class RootSetup:
                     self.adb.shell("input", "swipe", "720", "1900", "720", "850", "180", timeout=6)
             except Exception:
                 pass
-            time.sleep(0.22)
+            self._sleep_cancelable(0.22)
 
         notes.append("done=" + ",".join(f"{k}:{done[k]}" for k in targets))
         self._log(log, f"Kitsune settings UI: {' | '.join(notes)[:240]}")
@@ -1519,7 +1768,7 @@ class RootSetup:
             notes.append("back_once")
         except Exception as exc:
             notes.append(f"back_err={exc}")
-        time.sleep(0.25)
+        self._sleep_cancelable(0.25)
         return "|".join(notes)[:360]
 
     def configure_kitsune_flags(self, log: LogFn = None, reuse_session: bool = False) -> str:
@@ -1589,44 +1838,48 @@ echo FLAGS_DONE
             outs.append("sql=skip_ui_ok")
         return " | ".join(outs)[:450]
     # ------------------------------------------------------------------ Magisk
-    def magisk_binary_ok(self) -> bool:
-        """magisk 已装入系统/ramdisk：命令可用。优先普通 shell（无需 su）。"""
+    def magisk_binary_ok(self, allow_su: bool = True) -> bool:
+        """magisk 已装入系统/ramdisk：命令可用。优先普通 shell（无需 su）。
+
+        allow_su=False：重启后校验用，避免抢先 shell_su 打乱 STEP14 GRANT 时机。
+        """
         probes = [
             ("magisk", "-v"),
             ("magisk", "-V"),
             ("/data/adb/magisk/magisk64", "-v"),
+            ("/data/adb/magisk/magisk32", "-v"),
+            ("/data/adb/magisk/magisk", "-v"),
         ]
-        # 1) 普通 adb shell（MuMu 已 root 时 magisk 在 PATH）
+        # 1) 普通 adb shell（成功装上后 magisk 在 PATH，无需 su）
         for args in probes:
             try:
                 out = (self.adb.shell(*args, timeout=8) or "").strip()
                 low = out.lower()
                 if out and "not found" not in low and "inaccessible" not in low and "no such" not in low:
-                    if any(ch.isdigit() for ch in out) or "magisk" in low:
+                    if any(ch.isdigit() for ch in out) or "kitsune" in low or "magisk" in low:
                         return True
             except Exception:
                 continue
+        if not allow_su:
+            return False
         # 2) su 兜底
         for args in probes:
             try:
-                out = (self.adb.shell_su(" ".join(args)) or "").strip()
-                if out and "not found" not in out.lower() and "no such" not in out.lower():
-                    # 版本号或输出非空
-                    if any(ch.isdigit() for ch in out) or "magisk" in out.lower() or len(out) >= 1:
-                        # 过滤明显失败
+                out = (self.adb.shell_su(" ".join(args), timeout=10) or "").strip()
+                if out and "not found" not in out.lower() and "no such" not in out.lower() and "inaccessible" not in out.lower():
+                    if any(ch.isdigit() for ch in out) or "magisk" in out.lower() or "kitsune" in out.lower():
                         if "Permission denied" in out and "magisk" not in out.lower():
                             continue
                         if out and not out.startswith("su:"):
                             return True
             except Exception:
                 continue
-        # 目录存在也算部分就绪
+        # 目录 + version
         try:
-            out = self.adb.shell_su("ls /data/adb/magisk 2>/dev/null | head")
-            if out and ("magisk" in out or "modules" in out or "busybox" in out):
-                # 再试一次 version
-                ver = self.adb.shell_su("magisk -v 2>/dev/null || true")
-                if ver and "not found" not in ver.lower() and ver.strip():
+            out = self.adb.shell_su("ls /data/adb/magisk 2>/dev/null | head", timeout=10)
+            if out and ("magisk" in out or "busybox" in out or "boot_patch" in out):
+                ver = self.adb.shell_su("magisk -v 2>/dev/null || true", timeout=10)
+                if ver and "not found" not in ver.lower() and "inaccessible" not in ver.lower() and ver.strip():
                     return True
         except Exception:
             pass
@@ -1650,15 +1903,14 @@ echo FLAGS_DONE
             return False
 
         try:
-            self.adb.shell("am", "force-stop", self.MUMU_STORE_PKG, timeout=12)
+            self.adb.shell("am", "force-stop", self.MUMU_STORE_PKG, timeout=3)
             outs.append("store_fs")
         except Exception as exc:
             outs.append(f"store={exc}")
-        for pkg in ("com.android.documentsui", "com.google.android.documentsui"):
-            try:
-                self.adb.shell("am", "force-stop", pkg, timeout=10)
-            except Exception:
-                pass
+        try:
+            self._force_stop_pkgs(["com.android.documentsui", "com.google.android.documentsui"], timeout=3)
+        except Exception:
+            pass
 
         if not force_relaunch and _top_is_kitsune():
             outs.append("reuse_fg")
@@ -1667,7 +1919,7 @@ echo FLAGS_DONE
                     hit = self.adb.dismiss_magisk_su_dialog()
                     if hit:
                         outs.append(f"su={hit}")
-                        time.sleep(0.35)
+                        self._sleep_cancelable(0.35)
                 except Exception:
                     pass
             try:
@@ -1681,7 +1933,7 @@ echo FLAGS_DONE
                 self.adb.force_stop(self.kitsune_pkg)
             except Exception:
                 pass
-            time.sleep(0.25)
+            self._sleep_cancelable(0.25)
             outs.append("force_relaunch")
         else:
             outs.append("soft_launch")
@@ -1715,7 +1967,7 @@ echo FLAGS_DONE
                         break
                 except Exception as exc:
                     outs.append(str(exc)[:60])
-        time.sleep(0.55)
+        self._sleep_cancelable(0.55)
 
         # 等待前台确实是 Kitsune（实测：第一次 monkey 后常仍是桌面，需再拉一次）
         fg_ok = False
@@ -1735,7 +1987,7 @@ echo FLAGS_DONE
                 )
             except Exception:
                 pass
-            time.sleep(0.35 if i < 2 else 0.45)
+            self._sleep_cancelable(0.35 if i < 2 else 0.45)
         outs.append("fg_ok" if fg_ok else "fg_fail")
 
         # su: 只处理真正的 SuRequest，绝不因 Kitsune 首页误触 BACK
@@ -1744,7 +1996,7 @@ echo FLAGS_DONE
                 hit = self.adb.dismiss_magisk_su_dialog()
                 if hit:
                     outs.append(f"su={hit}")
-                    time.sleep(0.45)
+                    self._sleep_cancelable(0.45)
                     # 授权后确认仍在 Kitsune
                     if not _top_is_kitsune():
                         try:
@@ -1759,7 +2011,7 @@ echo FLAGS_DONE
                             )
                         except Exception:
                             pass
-                        time.sleep(1.0)
+                        self._sleep_cancelable(1.0)
                 else:
                     break
             except Exception as exc:
@@ -1786,7 +2038,7 @@ echo FLAGS_DONE
                     )
                 except Exception:
                     pass
-                time.sleep(0.9)
+                self._sleep_cancelable(0.9)
                 continue
             try:
                 ui = (self.adb.ui_full_text() or "").lower()
@@ -1800,7 +2052,7 @@ echo FLAGS_DONE
             ):
                 outs.append("ui_ok")
                 break
-            time.sleep(0.5)
+            self._sleep_cancelable(0.5)
         return " | ".join(outs)[:400]
 
     def dismiss_kitsune_notice_hide(self) -> str:
@@ -1854,7 +2106,7 @@ echo FLAGS_DONE
             reopen_used += 1
             notes.append(reason)
             try:
-                self.adb.shell("am", "force-stop", self.MUMU_STORE_PKG, timeout=10)
+                self.adb.shell("am", "force-stop", self.MUMU_STORE_PKG, timeout=3)
             except Exception:
                 pass
             try:
@@ -1869,7 +2121,7 @@ echo FLAGS_DONE
                 )
             except Exception:
                 pass
-            time.sleep(0.9)
+            self._sleep_cancelable(0.9)
             return True
 
         for attempt in range(4):
@@ -1939,14 +2191,14 @@ echo FLAGS_DONE
                         break
                     continue
                 notes.append(f"miss{attempt}")
-                time.sleep(0.35)
+                self._sleep_cancelable(0.35)
                 continue
 
             x1, y1, x2, y2 = b
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             self.adb.tap(cx, cy)
             notes.append(f"tap_hide@{cx},{cy}")
-            time.sleep(0.55)
+            self._sleep_cancelable(0.55)
             # 点 Hide 后立刻检查首页：必须仍在 Kitsune 且见 Install/Uninstall 才算成功
             try:
                 xml2 = self.adb.uiautomator_dump(force=True) or ""
@@ -1970,7 +2222,7 @@ echo FLAGS_DONE
                 break
             # 仍有警告卡则再点一次 Hide；绝不因此 force-stop/reopen Kitsune
             notes.append("hide_retry_same_session")
-            time.sleep(0.25)
+            self._sleep_cancelable(0.25)
         return "|".join(notes)[:280]
 
     def kitsune_ui_status(self, check_binary: bool = False, force_dump: bool = True) -> dict:
@@ -2276,7 +2528,7 @@ echo FLAGS_DONE
                 self._log(log, f"VM={vmindex} 见 Uninstall 后同会话继续 Shell/Settings，不结束 Magisk 进程")
             else:
                 self.open_kitsune(force_relaunch=bool(force_relaunch_once))
-                time.sleep(0.35 if not force_relaunch_once else 0.55)
+                self._sleep_cancelable(0.35 if not force_relaunch_once else 0.55)
                 notes.append("open_once" if force_relaunch_once else "soft_open")
         except Exception as exc:
             out["detail"] = f"open_fail={exc}"
@@ -2308,11 +2560,14 @@ echo FLAGS_DONE
             try:
                 flags = self.configure_kitsune_flags(log=log, reuse_session=True)
                 out["settings"] = flags
-                out["settings_done"] = True
-                notes.append("settings_ok")
+                # settings-ih8-truth-v1: 禁止「跑过 Settings 就算 ok」
+                all_on = self._settings_flags_all_on(str(flags))
+                out["settings_done"] = bool(all_on)
+                notes.append("settings_ok" if all_on else f"settings_partial:{str(flags)[:80]}")
                 self._log(log, f"VM={vmindex} [STEP15-16] Settings三项+BACK一次: {str(flags)[:160]}")
             except Exception as exc:
                 out["settings"] = f"err={exc}"
+                out["settings_done"] = False
                 notes.append(f"settings_err={exc}")
                 self._log(log, f"VM={vmindex} 一次会话 Settings 失败: {exc}")
         else:
@@ -2332,26 +2587,31 @@ echo FLAGS_DONE
                 out["ih8"] = ih
                 notes.append(f"ih8={str(ih)[:80]}")
                 self._log(log, f"VM={vmindex} [STEP17-19] Modules/Install from storage/ih8: {str(ih)[:160]}")
+                ih_ok = self._ih8_result_ok(str(ih))
                 need_restart = self._ih8_result_needs_restart(str(ih))
-                if need_restart:
+                if ih_ok:
                     out["ih8_done"] = True
-                    if restart_after_ih8 and vmindex is not None:
-                        rr = self.restart_vm_and_wait(
-                            int(vmindex),
-                            log=log,
-                            boot_timeout=boot_timeout,
-                            reason="ih8 module installed (one-session)",
-                        )
-                        out["rebooted"] = str(rr).startswith("ok") or rr is True or str(rr) == "ok"
-                        out["ih8"] = f"{ih}|restart={rr}"
-                        notes.append(f"restart={rr}")
+                    if need_restart:
+                        if restart_after_ih8 and vmindex is not None:
+                            rr = self.restart_vm_and_wait(
+                                int(vmindex),
+                                log=log,
+                                boot_timeout=boot_timeout,
+                                reason="ih8 module installed (one-session)",
+                            )
+                            out["rebooted"] = str(rr).startswith("ok") or rr is True or str(rr) == "ok"
+                            out["ih8"] = f"{ih}|restart={rr}"
+                            notes.append(f"restart={rr}")
+                        else:
+                            notes.append("ih8_need_restart_deferred")
                     else:
-                        notes.append("ih8_need_restart_deferred")
+                        notes.append("ih8_already")
                 else:
-                    out["ih8_done"] = True
-                    notes.append("ih8_already")
+                    out["ih8_done"] = False
+                    notes.append("ih8_fail_no_done")
             except Exception as exc:
                 out["ih8"] = f"err={exc}"
+                out["ih8_done"] = False
                 notes.append(f"ih8_err={exc}")
                 self._log(log, f"VM={vmindex} 一次会话 ih8 失败: {exc}")
         else:
@@ -2463,12 +2723,12 @@ echo FLAGS_DONE
                         return result
                     # 新建但 Settings 未完成：才打开一次补 Settings
                     try:
-                        self.adb.shell("am", "force-stop", self.MUMU_STORE_PKG, timeout=12)
+                        self.adb.shell("am", "force-stop", self.MUMU_STORE_PKG, timeout=3)
                     except Exception:
                         pass
                     self._log(log, f"VM={vmindex} [STEP1] 缓存命中但 Settings 未完成，打开一次补 Settings")
                     self.open_kitsune(force_relaunch=True)
-                    time.sleep(1.4)
+                    self._sleep_cancelable(1.4)
                     try:
                         self.dismiss_kitsune_notice_hide()
                     except Exception:
@@ -2552,6 +2812,61 @@ echo FLAGS_DONE
         return full
 
 
+
+    def _with_magisk_ui_slot(self, vmindex: int, log: LogFn, boot_timeout: int, fn):
+        """magisk-ui-slot-v2: 最多 10 台同时做 Magisk/Kitsune UI；排队时每 15s 打日志。"""
+        got = False
+        t0 = time.time()
+        try:
+            timeout = max(180, int(boot_timeout) + 120)
+            self._log(log, f"VM={vmindex} wait Magisk UI slot ... (max={timeout}s cap=10)")
+            deadline = t0 + timeout
+            last_beat = t0
+            while True:
+                if self._cancelled():
+                    self._log(log, f"VM={vmindex} Magisk UI slot wait cancelled")
+                    return {
+                        "needed": True,
+                        "installed": False,
+                        "rebooted": False,
+                        "detail": "magisk_ui_sema_cancelled",
+                        "skipped_cached": False,
+                    }
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                slice_t = min(1.0, remaining)
+                got = bool(self._magisk_ui_sema.acquire(timeout=slice_t))
+                if got:
+                    break
+                now = time.time()
+                if now - last_beat >= 15.0:
+                    self._log(
+                        log,
+                        f"VM={vmindex} Magisk UI slot 排队中 waited={now - t0:.0f}s "
+                        f"(后半段限流，不是流程被跳过)",
+                    )
+                    last_beat = now
+            waited = time.time() - t0
+            if not got:
+                self._log(log, f"VM={vmindex} Magisk UI slot timeout waited={waited:.1f}s")
+                return {
+                    "needed": True,
+                    "installed": False,
+                    "rebooted": False,
+                    "detail": f"magisk_ui_sema_timeout waited={waited:.1f}s",
+                    "skipped_cached": False,
+                }
+            self._log(log, f"VM={vmindex} got Magisk UI slot waited={waited:.1f}s")
+            return fn()
+        finally:
+            if got:
+                try:
+                    self._magisk_ui_sema.release()
+                except Exception:
+                    pass
+                self._log(log, f"VM={vmindex} release Magisk UI slot")
+
     def ensure_kitsune_magisk_direct_install(
         self,
         vmindex: int,
@@ -2602,22 +2917,31 @@ echo FLAGS_DONE
             "settings_done": False,
         }
         if not force and self.is_kitsune_done(vmindex):
-            # 登录可缓存跳过；新建必须 magisk binary + settings 都真完成，否则清缓存重跑
+            # 登录可缓存跳过；新建必须 magisk binary + settings(+ih8) 都真完成，否则清缓存重跑
             # 防止删除后索引复用 kitsune_ok_vmN.json 误跳过 Direct Install
             bin_ok = False
             try:
-                bin_ok = bool(self.magisk_binary_ok())
+                bin_ok = bool(self.magisk_binary_ok(allow_su=True))
             except Exception:
                 bin_ok = False
             settings_ok = bool(self.is_kitsune_settings_done(vmindex))
-            if configure_settings and not (bin_ok and settings_ok):
+            ih8_ok = True
+            if configure_settings and install_ih8:
+                ih8_ok = False
+                try:
+                    mods = self.adb.shell_su("ls /data/adb/modules 2>/dev/null", timeout=12) or ""
+                    low = mods.lower()
+                    ih8_ok = ("ih8" in low) or ("securelock" in low)
+                except Exception:
+                    ih8_ok = False
+            if configure_settings and not (bin_ok and settings_ok and ih8_ok):
                 self.clear_kitsune_done(vmindex)
                 self._log(
                     log,
                     f"VM={vmindex} 新建 kitsune 缓存失效"
-                    f"(bin={bin_ok} settings={settings_ok})，强制完整 Install/Direct Install",
+                    f"(bin={bin_ok} settings={settings_ok} ih8={ih8_ok})，强制完整 Install/Direct Install",
                 )
-            elif (not configure_settings) or (bin_ok and settings_ok):
+            elif (not configure_settings) or (bin_ok and settings_ok and ih8_ok):
                 result["installed"] = True
                 result["skipped_cached"] = True
                 result["settings_done"] = settings_ok
@@ -2634,9 +2958,30 @@ echo FLAGS_DONE
                 return result
 
         if not self.adb.package_installed(self.kitsune_pkg):
-            result["detail"] = "kitsune_pkg_missing"
-            self._log(log, f"VM={vmindex} Kitsune 包未安装")
-            return result
+            # kitsune-reinstall-on-missing-v1: 不改流程，只在进入 UI 前补装一次
+            self._log(log, f"VM={vmindex} Kitsune 包未安装 → 自动补装后再继续 Direct Install")
+            try:
+                self.adb.connect()
+            except Exception:
+                pass
+            try:
+                ins = self.ensure_packages(
+                    vmindex,
+                    install_nekobox=False,
+                    install_kitsune=True,
+                    install_ih8=False,
+                    install_venmo=False,
+                    install_aurora=False,
+                    prefer_aurora_venmo=False,
+                    log=log,
+                )
+                self._log(log, f"VM={vmindex} Kitsune 补装结果={str(ins.get('kitsune'))[:120]}")
+            except Exception as exc:
+                self._log(log, f"VM={vmindex} Kitsune 补装异常: {exc}")
+            if not self.adb.package_installed(self.kitsune_pkg):
+                result["detail"] = "kitsune_pkg_missing"
+                self._log(log, f"VM={vmindex} Kitsune 包未安装(补装后仍无)")
+                return result
 
         self._log(
             log,
@@ -2644,7 +2989,7 @@ echo FLAGS_DONE
             f"(settings={'on' if configure_settings else 'off'})",
         )
         try:
-            self.adb.shell("am", "force-stop", self.MUMU_STORE_PKG, timeout=12)
+            self.adb.shell("am", "force-stop", self.MUMU_STORE_PKG, timeout=3)
         except Exception:
             pass
 
@@ -2659,18 +3004,18 @@ echo FLAGS_DONE
                 self.adb.shell("am", "kill", self.kitsune_pkg, timeout=10)
             except Exception:
                 pass
-            time.sleep(0.45)
+            self._sleep_cancelable(0.45)
             try:
                 self.adb.shell("input", "keyevent", "3", timeout=8)
             except Exception:
                 pass
-            time.sleep(0.25)
+            self._sleep_cancelable(0.25)
             try:
                 # force_relaunch=True 确保干净重开，避免停在方法页/桌面
                 self.open_kitsune(force_relaunch=True)
             except Exception as exc:
                 self._log(log, f"VM={vmindex} 重开 Kitsune 失败: {exc}")
-            time.sleep(0.55)
+            self._sleep_cancelable(0.55)
             try:
                 hide = self.dismiss_kitsune_notice_hide()
                 if hide:
@@ -2698,7 +3043,7 @@ echo FLAGS_DONE
                 self.open_kitsune(force_relaunch=bool(force_relaunch))
             except Exception as exc:
                 self._log(log, f"VM={vmindex} 打开 Kitsune 失败: {exc}")
-            time.sleep(0.7 if force_relaunch else 0.35)
+            self._sleep_cancelable(0.7 if force_relaunch else 0.35)
             try:
                 hide = self.dismiss_kitsune_notice_hide()
                 if hide:
@@ -2734,7 +3079,7 @@ echo FLAGS_DONE
                     return st
                 if "magisk" in ui and ("install" in ui or "uninstall" in ui or "ramdisk" in ui):
                     return st
-                time.sleep(0.28)
+                self._sleep_cancelable(0.28)
             return last
 
         def _tap_home_install(retries: int = 8) -> bool:
@@ -2768,7 +3113,7 @@ echo FLAGS_DONE
                         log,
                         f"VM={vmindex} Install后3.5s内未见su弹窗(可能已永久授权/临时授权残留或稍后弹出)",
                     )
-                time.sleep(0.45)
+                self._sleep_cancelable(0.45)
 
             def _confirm_left_home_or_method() -> bool:
                 try:
@@ -2800,7 +3145,7 @@ echo FLAGS_DONE
                     hit_su = self.adb.dismiss_magisk_su_dialog()
                     if hit_su:
                         self._log(log, f"VM={vmindex} 点首页 Install 前 su: {hit_su}")
-                        time.sleep(0.3)
+                        self._sleep_cancelable(0.3)
                 except Exception:
                     pass
 
@@ -2814,14 +3159,14 @@ echo FLAGS_DONE
                     return False
 
                 # desktop-no-blind-tap-v1: desktop/not-foreground -> soft relaunch, never blind coord
+                # su-not-desktop-v1: "Kitsune Mask" 标题/SU弹窗不是桌面
                 on_desktop = (
-                    "io.github.huskydg.magisk:id/" not in low
+                    "io.github.huskydg.magisk" not in low
                     and (
                         "mumu store" in low
                         or "app cloner" in low
                         or "search games" in low
                         or "lawnchair" in low
-                        or ("kitsune mask" in low and "ramdisk" not in low and "home_magisk_button" not in low)
                     )
                 )
                 top_kitsune = False
@@ -2851,7 +3196,7 @@ echo FLAGS_DONE
                         self.open_kitsune(force_relaunch=False)
                     except Exception as exc:
                         self._log(log, f"VM={vmindex} 软拉回Kitsune异常: {exc}")
-                    time.sleep(0.55)
+                    self._sleep_cancelable(0.55)
                     continue
 
                 # 已在方法页则视为成功
@@ -2877,7 +3222,7 @@ echo FLAGS_DONE
                         log,
                         f"VM={vmindex} 点首页 Install attempt={attempt} bounds={b} install_tap_immediate",
                     )
-                    time.sleep(0.85)
+                    self._sleep_cancelable(0.85)
                     _after_install_su(f"vm{vmindex}_install_su")
                     return True
 
@@ -2909,7 +3254,7 @@ echo FLAGS_DONE
                             log,
                             f"VM={vmindex} 点首页 Install attempt={attempt} bounds={b} hide_done_go_install",
                         )
-                        time.sleep(0.85)
+                        self._sleep_cancelable(0.85)
                         _after_install_su(f"vm{vmindex}_install_su")
                         return True
 
@@ -2917,7 +3262,7 @@ echo FLAGS_DONE
                 try:
                     if self.adb.tap_exact_text("Install"):
                         self._log(log, f"VM={vmindex} tap_exact Install attempt={attempt}")
-                        time.sleep(0.85)
+                        self._sleep_cancelable(0.85)
                         _after_install_su(f"vm{vmindex}_install_su_text")
                         return True
                 except Exception:
@@ -2932,7 +3277,7 @@ echo FLAGS_DONE
                             log,
                             f"VM={vmindex} tap_id home_magisk_button attempt={attempt}",
                         )
-                        time.sleep(0.85)
+                        self._sleep_cancelable(0.85)
                         _after_install_su(f"vm{vmindex}_install_su_rid")
                         return True
                 except Exception:
@@ -2956,7 +3301,7 @@ echo FLAGS_DONE
                             f"VM={vmindex} 点首页 Install 坐标兜底 attempt={attempt} "
                             f"xy={fallback_xy} has_text={has_install_text}",
                         )
-                        time.sleep(0.9)
+                        self._sleep_cancelable(0.9)
                         if _confirm_left_home_or_method():
                             _after_install_su(f"vm{vmindex}_install_su_xy")
                             return True
@@ -2979,10 +3324,10 @@ echo FLAGS_DONE
                     f"xml_len={len(xml or '')} has_home_btn={'home_magisk_button' in low} "
                     f"ui_snip={(self.adb.ui_full_text() or '')[:80]!r}",
                 )
-                time.sleep(0.45)
+                self._sleep_cancelable(0.45)
             return False
 
-        def _wait_third_direct(attempts: int = 12):
+        def _wait_third_direct(attempts: int = 18):
             """点完 Install 后轮询第3项 Direct Install (modify /system directly)。
 
             direct-install-wait-v2（修 only-patch-instant-reopen 秒放弃）：
@@ -2990,6 +3335,10 @@ echo FLAGS_DONE
             - 仅见 Patch：先 Forever+Allow，必要时 BACK 再点 Install 刷新方法页，多轮等待
             - dump 为空或方法页未出：继续轮询，不要秒返回
             - 持续多轮仍无第3项才返回 ONLY_PATCH，由外层最多杀进程重开 1 次
+
+            only-patch-patience-v1：
+            - ADB 拥堵时第3项常晚出现；仅见Patch 多等/多刷新，不要过早 ONLY_PATCH
+            - 刷新点 3/6/9/12；streak 上限 14；轮询间隔略加长
 
             desktop-empty-soft-pull-v1：
             - 掉桌面/空 dump 时不要空等满 attempts（约 40s）
@@ -3033,7 +3382,7 @@ echo FLAGS_DONE
                                 f"VM={vmindex} 选择第3项 Direct Install (rid method_direct_system) "
                                 f"attempt={attempt_i} opts={hint!r}",
                             )
-                            time.sleep(1.0)
+                            self._sleep_cancelable(1.0)
                             return True
                     except Exception:
                         pass
@@ -3055,7 +3404,7 @@ echo FLAGS_DONE
                                     f"VM={vmindex} 选择第3项 Direct Install (text) "
                                     f"label={lab!r} attempt={attempt_i} opts={hint!r}",
                                 )
-                                time.sleep(1.0)
+                                self._sleep_cancelable(1.0)
                                 return True
                         except Exception:
                             continue
@@ -3068,7 +3417,7 @@ echo FLAGS_DONE
                     f"VM={vmindex} 选择第3项 Direct Install (modify /system directly) "
                     f"label={method_label!r} attempt={attempt_i} center=({cx},{cy}) opts={hint!r}",
                 )
-                time.sleep(1.0)
+                self._sleep_cancelable(1.0)
                 return True
 
             for attempt in range(total):
@@ -3078,7 +3427,7 @@ echo FLAGS_DONE
                     su_hit = self.adb.dismiss_magisk_su_dialog()
                     if su_hit:
                         self._log(log, f"VM={vmindex} 方法页前 su 授权: {su_hit}")
-                        time.sleep(0.45)
+                        self._sleep_cancelable(0.45)
                 except Exception:
                     pass
                 try:
@@ -3088,7 +3437,7 @@ echo FLAGS_DONE
                 if len(xml) < 80:
                     empty_streak += 1
                     try:
-                        time.sleep(0.35)
+                        self._sleep_cancelable(0.35)
                         xml = self.adb.uiautomator_dump(force=True) or xml
                     except Exception:
                         pass
@@ -3096,16 +3445,26 @@ echo FLAGS_DONE
                     empty_streak = 0
 
                 low_probe = (xml or "").lower()
+                # su-not-desktop-v1: SU授权弹窗/包名也算 Magisk UI，禁止当桌面 soft_pull
+                su_dialog = (
+                    "surequest" in low_probe
+                    or "su request" in low_probe
+                    or "remember choice forever" in low_probe
+                    or ("grant" in low_probe and "magisk" in low_probe)
+                    or ("forever" in low_probe and "allow" in low_probe)
+                )
                 has_magisk_markers = (
                     "method_direct" in low_probe
-                    or "io.github.huskydg.magisk:id/" in low_probe
+                    or "io.github.huskydg.magisk" in low_probe
                     or "ramdisk" in low_probe
                     or "uninstall magisk" in low_probe
                     or "select and patch" in low_probe
                     or "modify /system" in low_probe
+                    or "direct install" in low_probe
                     or "home_magisk_button" in low_probe
                     or "let's go" in low_probe
                     or "lets go" in low_probe
+                    or su_dialog
                 )
                 on_desktop = (
                     not has_magisk_markers
@@ -3114,11 +3473,6 @@ echo FLAGS_DONE
                         or "app cloner" in low_probe
                         or "search games" in low_probe
                         or "lawnchair" in low_probe
-                        or (
-                            "kitsune mask" in low_probe
-                            and "ramdisk" not in low_probe
-                            and "home_magisk_button" not in low_probe
-                        )
                     )
                 )
                 if on_desktop:
@@ -3131,6 +3485,18 @@ echo FLAGS_DONE
                     no_magisk_streak = 0
                 else:
                     no_magisk_streak += 1
+
+                # 方法页等待时若是 SU 弹窗：先授权，绝不 soft_pull 打回首页
+                if su_dialog and not self._cancelled():
+                    try:
+                        su_hit2 = self.adb.dismiss_magisk_su_dialog()
+                        if su_hit2:
+                            self._log(log, f"VM={vmindex} 方法页等待 su 授权(非桌面): {su_hit2}")
+                        self._sleep_cancelable(0.45)
+                    except Exception:
+                        pass
+                    self._sleep_cancelable(0.35)
+                    continue
 
                 # desktop/empty/no-magisk UI soft pull
                 need_soft_pull = (
@@ -3150,7 +3516,7 @@ echo FLAGS_DONE
                         self.open_kitsune(force_relaunch=False)
                     except Exception as exc:
                         self._log(log, f"VM={vmindex} 方法页软拉回Kitsune异常: {exc}")
-                    time.sleep(0.45)
+                    self._sleep_cancelable(0.45)
                     try:
                         xml_soft = self.adb.uiautomator_dump(force=True) or ""
                     except Exception:
@@ -3172,11 +3538,11 @@ echo FLAGS_DONE
                                 f"VM={vmindex} 软拉回后点首页 Install attempt={attempt} "
                                 f"bounds={b_home_soft}",
                             )
-                            time.sleep(0.9)
+                            self._sleep_cancelable(0.9)
                         except Exception as exc:
                             self._log(log, f"VM={vmindex} 软拉回后点Install异常: {exc}")
                     else:
-                        time.sleep(0.35)
+                        self._sleep_cancelable(0.35)
                     # 软拉回后进入下一轮重新 dump，不拉长 only_patch / max_kill
                     continue
 
@@ -3219,7 +3585,7 @@ echo FLAGS_DONE
                         f"VM={vmindex} 已见第3项文案/RID 但点击失败，重试 "
                         f"attempt={attempt} visible={last_hint!r}",
                     )
-                    time.sleep(0.5)
+                    self._sleep_cancelable(0.5)
                     continue
 
                 b, method_label = self._find_kitsune_third_direct_install(xml)
@@ -3241,14 +3607,14 @@ echo FLAGS_DONE
                                 log,
                                 f"VM={vmindex} 仅见Patch→永久授权: {su_hit2} streak={only_patch_streak}",
                             )
-                            time.sleep(0.6)
+                            self._sleep_cancelable(0.6)
                     except Exception as exc:
                         self._log(log, f"VM={vmindex} 仅见Patch补授权异常: {exc}")
 
-                    if only_patch_streak in (2, 5, 8) and not self._cancelled():
+                    if only_patch_streak in (3, 6, 9, 12) and not self._cancelled():
                         try:
                             self.adb.shell("input", "keyevent", "4", timeout=3)
-                            time.sleep(0.55)
+                            self._sleep_cancelable(0.7)
                             xml_home = self.adb.uiautomator_dump(force=True) or ""
                             b_home = self._find_kitsune_home_install_bounds(xml_home)
                             if b_home:
@@ -3259,18 +3625,18 @@ echo FLAGS_DONE
                                     f"VM={vmindex} 仅见Patch→BACK后重进Install刷新方法页 "
                                     f"streak={only_patch_streak}",
                                 )
-                                time.sleep(1.0)
+                                self._sleep_cancelable(1.4)
                                 continue
                         except Exception as exc:
                             self._log(log, f"VM={vmindex} 刷新方法页异常: {exc}")
 
-                    if only_patch_streak < 8:
+                    if only_patch_streak < 14:
                         self._log(
                             log,
                             f"VM={vmindex} 仅见Patch，继续等第3项 "
                             f"attempt={attempt} streak={only_patch_streak} visible={last_hint!r}",
                         )
-                        time.sleep(0.75)
+                        self._sleep_cancelable(1.15 if only_patch_streak <= 6 else 1.4)
                         continue
 
                     self._log(
@@ -3287,7 +3653,7 @@ echo FLAGS_DONE
                 if b2 and attempt < total - 1:
                     self.adb.tap_bounds(b2)
                     self._log(log, f"VM={vmindex} 方法页未出现，再点 Install attempt={attempt}")
-                    time.sleep(0.9)
+                    self._sleep_cancelable(0.9)
                     continue
 
                 self._log(
@@ -3295,7 +3661,7 @@ echo FLAGS_DONE
                     f"VM={vmindex} 等待方法页第3项 attempt={attempt} "
                     f"empty_streak={empty_streak} visible={last_hint!r}",
                 )
-                time.sleep(0.7 if empty_streak else 0.55)
+                self._sleep_cancelable(0.7 if empty_streak else 0.55)
 
             if saw_only_patch:
                 return False, method_label, f"ONLY_PATCH|{last_hint}"
@@ -3325,9 +3691,11 @@ echo FLAGS_DONE
                 result["grant"] = sess.get("grant", "")
                 if sess.get("settings_done"):
                     result["settings_done"] = True
-                if sess.get("ih8_done") or sess.get("ih8"):
-                    result["ih8_done"] = True
+                if sess.get("ih8"):
                     result["ih8"] = str(sess.get("ih8") or "")
+                # 只认真实 ih8_done，失败串不再抬成 done
+                if sess.get("ih8_done"):
+                    result["ih8_done"] = True
                 if sess.get("rebooted"):
                     result["rebooted"] = True
                 self._log(log, f"VM={vmindex} 已装路径一次会话: {detail_s[:200]}")
@@ -3436,10 +3804,10 @@ echo FLAGS_DONE
                         self.open_kitsune(force_relaunch=False)
                     except Exception as exc:
                         self._log(log, f"VM={vmindex} 桌面软拉回异常: {exc}")
-                    time.sleep(0.8)
+                    self._sleep_cancelable(0.8)
                 else:
                     self._log(log, f"VM={vmindex} 首页未就绪，短等 2s 再识别 Install")
-                    time.sleep(2.0)
+                    self._sleep_cancelable(2.0)
                 st = _wait_home_ready(timeout=4.0)
             self._log(
                 log,
@@ -3502,7 +3870,7 @@ echo FLAGS_DONE
                                     log,
                                     f"VM={vmindex} round={round_i} 最终坐标硬点 Install (1120,512) only_on_magisk_home",
                                 )
-                                time.sleep(1.0)
+                                self._sleep_cancelable(1.0)
                                 try:
                                     ui_after = (self.adb.ui_full_text() or "").lower()
                                 except Exception:
@@ -3547,8 +3915,8 @@ echo FLAGS_DONE
                         continue
 
             self._log(log, f"VM={vmindex} [STEP5-6] 已点完 Install，开始检查 Direct Install (modify /system directly)")
-            time.sleep(0.45)
-            method_ok, method_label, last_opts = _wait_third_direct(attempts=14)
+            self._sleep_cancelable(0.45)
+            method_ok, method_label, last_opts = _wait_third_direct(attempts=18)
             if method_ok:
                 break
 
@@ -3590,44 +3958,243 @@ echo FLAGS_DONE
                 pass
             return result
 
-        for label in ("LET'S GO", "Let's go", "LETS GO", "Next", "NEXT", "开始", "确定", "OK"):
+        # 2026-07-31 flash-desktop-recover-v1:
+        # 选中 Direct Install 后若掉桌面导致点不到 LET'S GO / 刷写页消失，
+        # 软拉回 Kitsune 重走 Direct Install + LET'S GO（步骤不变，只加强恢复）。
+        def _ui_is_desktop(ui: str) -> bool:
+            low = (ui or "").lower()
+            if any(
+                k in low
+                for k in (
+                    "installing:",
+                    "all done",
+                    "device platform",
+                    "magisk delta",
+                    "modify /system",
+                    "select and patch",
+                    "method_direct",
+                    "let's go",
+                    "lets go",
+                    "ramdisk",
+                    "uninstall magisk",
+                    "home_magisk",
+                    "io.github.huskydg.magisk",
+                    "installation complete",
+                    "zygisk",
+                )
+            ):
+                return False
+            return any(
+                k in low
+                for k in (
+                    "mumu store",
+                    "app cloner",
+                    "search games",
+                    "lawnchair",
+                )
+            )
+
+        def _tap_lets_go_labels() -> bool:
+            for label in ("LET'S GO", "Let's go", "LETS GO", "Next", "NEXT", "开始", "确定", "OK"):
+                try:
+                    xml = self.adb.uiautomator_dump(force=True) or ""
+                    b = self._find_text_bounds_exclude(
+                        xml,
+                        must_contain=label,
+                        exclude_any=("direct install", "recommended", "modify /system", "uninstall"),
+                        exact_text=False,
+                    )
+                    if b:
+                        self.adb.tap_bounds(b)
+                        self._log(log, f"VM={vmindex} 点击 {label}")
+                        self._sleep_cancelable(1.5)
+                        return True
+                    if self.adb.tap_text(label):
+                        self._log(log, f"VM={vmindex} tap_text {label}")
+                        self._sleep_cancelable(1.5)
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        def _recover_direct_and_lets_go(reason: str) -> bool:
+            self._log(log, f"VM={vmindex} Magisk flash 恢复: {reason} → 软拉回Kitsune")
+            try:
+                self.open_kitsune(force_relaunch=False)
+            except Exception as exc:
+                self._log(log, f"VM={vmindex} flash恢复软拉回异常: {exc}")
+            self._sleep_cancelable(0.55)
             try:
                 xml = self.adb.uiautomator_dump(force=True) or ""
-                b = self._find_text_bounds_exclude(
-                    xml,
-                    must_contain=label,
-                    exclude_any=("direct install", "recommended", "modify /system", "uninstall"),
-                    exact_text=False,
-                )
-                if b:
-                    self.adb.tap_bounds(b)
-                    self._log(log, f"VM={vmindex} 点击 {label}")
-                    time.sleep(1.5)
-                    break
-                if self.adb.tap_text(label):
-                    self._log(log, f"VM={vmindex} tap_text {label}")
-                    time.sleep(1.5)
-                    break
             except Exception:
-                continue
+                xml = ""
+            low = (xml or "").lower()
+            if any(
+                k in low
+                for k in (
+                    "all done",
+                    "installation complete",
+                    "安装完成",
+                    "刷写完成",
+                    "installing:",
+                    "device platform",
+                    "magisk delta",
+                )
+            ):
+                return True
+            if (
+                "modify /system directly" in low
+                or "method_direct_system" in low
+                or "modify /systemdirectly" in low
+            ):
+                try:
+                    if self.adb.tap_text("Direct Install (modify /system directly)") or self.adb.tap_text(
+                        "modify /system directly"
+                    ):
+                        self._log(log, f"VM={vmindex} flash恢复重选 Direct Install")
+                        self._sleep_cancelable(0.85)
+                except Exception:
+                    pass
+                return _tap_lets_go_labels()
+            b_home = None
+            try:
+                b_home = self._find_kitsune_home_install_bounds(xml)
+            except Exception:
+                b_home = None
+            if b_home:
+                try:
+                    self.adb.tap_bounds(b_home)
+                    self._log(log, f"VM={vmindex} flash恢复点首页 Install bounds={b_home}")
+                    self._sleep_cancelable(0.9)
+                except Exception as exc:
+                    self._log(log, f"VM={vmindex} flash恢复点Install异常: {exc}")
+            ok2, lab2, opts2 = _wait_third_direct(attempts=12)
+            if not ok2:
+                self._log(log, f"VM={vmindex} flash恢复未再见到 Direct Install opts={opts2!r}")
+                return False
+            self._log(log, f"VM={vmindex} flash恢复再次选中 Direct Install label={lab2!r}")
+            return _tap_lets_go_labels()
 
-        time.sleep(2.0)
-        for _ in range(8):
+        lets_go_ok = False
+        for lg_try in range(4):
+            if self._cancelled():
+                result["detail"] = "cancelled"
+                return result
+            if _tap_lets_go_labels():
+                lets_go_ok = True
+                break
+            try:
+                ui0 = (self.adb.ui_full_text() or "").lower()
+            except Exception:
+                ui0 = ""
+            if any(
+                k in ui0
+                for k in (
+                    "installing:",
+                    "device platform",
+                    "magisk delta",
+                    "all done",
+                    "installation complete",
+                )
+            ):
+                lets_go_ok = True
+                self._log(log, f"VM={vmindex} LET'S GO 时已在刷写/完成页")
+                break
+            if _ui_is_desktop(ui0) or lg_try >= 1:
+                if _recover_direct_and_lets_go(
+                    f"lets_go_miss try={lg_try} desktop={_ui_is_desktop(ui0)}"
+                ):
+                    lets_go_ok = True
+                    break
+                self._sleep_cancelable(0.55)
+                continue
+            self._sleep_cancelable(0.45)
+        if not lets_go_ok:
+            self._log(log, f"VM={vmindex} LET'S GO 多次未点到，进入刷写等待并继续桌面恢复")
+
+        # Direct Install 刷写在并发下可能 >12s；等到 All done/完成 再 restart，降低假成功
+        self._sleep_cancelable(2.0)
+        saw_done = False
+        saw_flash = False
+        desktop_streak = 0
+        flash_soft_pulls = 0
+        for wait_i in range(40):  # ~80s max，含掉桌面恢复
             try:
                 ui = (self.adb.ui_full_text() or "").lower()
             except Exception:
                 ui = ""
-            if any(k in ui for k in ("done", "reboot", "complete", "完成", "all done", "installed")):
-                self._log(log, f"VM={vmindex} Magisk install progress ui={ui[:140]!r}")
+            # 严格完成信号：禁止单独用「完成/complete!」（MuMu/其它界面易误触发导致过早 restart）
+            done_keys = (
+                "all done",
+                "all done!",
+                "installation complete",
+                "installation done",
+                "flash complete",
+                "安装完成",
+                "刷写完成",
+            )
+            flash_keys = (
+                "installing:",
+                "device platform",
+                "magisk delta",
+                "flashing",
+            )
+            if any(k in ui for k in flash_keys):
+                saw_flash = True
+                desktop_streak = 0
+            # 仍在 installing 开头且未见 all done 时不算完成
+            if any(k in ui for k in done_keys) and not (
+                ("- installing:" in ui or "installing:" in ui)
+                and "all done" not in ui
+                and "installation complete" not in ui
+                and "安装完成" not in ui
+            ):
+                saw_done = True
+                saw_flash = True
+                self._log(log, f"VM={vmindex} Magisk install DONE ui={ui[:140]!r}")
                 for lab in ("DONE", "Done", "OK", "CLOSE", "Close", "REBOOT", "Reboot"):
                     try:
                         if self.adb.tap_text(lab):
-                            time.sleep(1.0)
+                            self._sleep_cancelable(1.0)
                             break
                     except Exception:
                         pass
                 break
-            time.sleep(1.5)
+            if any(k in ui for k in ("failed", "error", "!installation")) and "direct install" not in ui:
+                self._log(log, f"VM={vmindex} Magisk install 可能失败 ui={ui[:140]!r}")
+            if _ui_is_desktop(ui):
+                desktop_streak += 1
+            else:
+                desktop_streak = 0
+            # 掉桌面且尚未见刷写进度：软拉回并重走 Direct/LETS GO
+            if (
+                (not saw_done)
+                and (not saw_flash)
+                and desktop_streak >= 2
+                and flash_soft_pulls < 4
+                and (not self._cancelled())
+            ):
+                flash_soft_pulls += 1
+                desktop_streak = 0
+                if _recover_direct_and_lets_go(
+                    f"flash_wait_desktop tick={wait_i} soft={flash_soft_pulls}"
+                ):
+                    self._sleep_cancelable(1.2)
+                    continue
+            # 仍在刷写则继续等
+            if wait_i in (0, 5, 10, 20, 30):
+                self._log(
+                    log,
+                    f"VM={vmindex} Magisk install 等待完成 tick={wait_i} "
+                    f"flash={saw_flash} desktop_streak={desktop_streak} ui={ui[:100]!r}",
+                )
+            self._sleep_cancelable(2.0)
+        if not saw_done:
+            self._log(
+                log,
+                f"VM={vmindex} Magisk install 未明确看到 All done "
+                f"(saw_flash={saw_flash} soft_pulls={flash_soft_pulls})，仍按流程 restart（重启后严格校验）",
+            )
 
         result["detail"] = (
             f"tapped_install={tapped} method={method_ok} label={method_label!r} "
@@ -3648,7 +4215,7 @@ echo FLAGS_DONE
             self._log(log, f"VM={vmindex} restart 失败: {exc2}")
 
         try:
-            time.sleep(8.0)
+            self._sleep_cancelable(8.0)
             self.mumu.adb_connect(vmindex)
             self.adb.connect()
             self.adb.wait_device(timeout=min(120, int(boot_timeout)))
@@ -3661,24 +4228,39 @@ echo FLAGS_DONE
             # 重启后只看 UI。禁止这里 su/shell。
             # 规则: 点 LET'S GO 并第一次 restart 完成后，才发起 shell 弹 GRANT。
             _open_once("post_reboot_verify", force_relaunch=False)
+            # verify-direct-install-v1: 重启后必须看 Uninstall 或 magisk binary
+            # 先看 UI Uninstall；binary 仅普通 shell（不 su，避免抢 GRANT）
             st2 = self.kitsune_ui_status(check_binary=False, force_dump=True)
             post_uninstall = bool(st2.get("has_uninstall_magisk"))
             binary = False
+            try:
+                binary = bool(self.magisk_binary_ok(allow_su=False))
+            except Exception:
+                binary = False
             result["detail"] += (
                 f" post_ui uninstall={post_uninstall} install_btn={st2.get('has_install_button')} "
-                f"binary=deferred"
+                f"binary={binary}"
             )
             self._log(
                 log,
-                f"VM={vmindex} 重启后 Kitsune uninstall={post_uninstall} (shell/GRANT later)",
+                f"VM={vmindex} 重启后 Kitsune uninstall={post_uninstall} binary={binary} (shell/GRANT later)",
             )
         except Exception as exc:
             result["detail"] += f" post_check_err={exc}"
         # 验证后不 force-stop：一次会话连续 Shell/Settings/ih8
 
-        # Direct Install 重启后: UI 见 Uninstall，或本轮已 method_ok，进入授权会话
-        result["installed"] = bool(post_uninstall or method_ok or tapped)
-        result["detail"] += f" after_boot uninstall={post_uninstall} method_ok={method_ok}"
+        # Direct Install 重启后: 仅 Uninstall 或 magisk binary 才算装上（禁止仅凭 tapped/method_ok 假成功）
+        result["installed"] = bool(post_uninstall or binary)
+        result["detail"] += (
+            f" after_boot uninstall={post_uninstall} binary={binary} "
+            f"method_ok={method_ok} tapped={tapped}"
+        )
+        if (not result["installed"]) and (method_ok or tapped):
+            result["detail"] += " soft_tap_verify_fail"
+            self._log(
+                log,
+                f"VM={vmindex} Direct Install 点过但重启后无 Uninstall/magisk binary，不写成功缓存",
+            )
         if result["installed"]:
             try:
                 self._log(log, f"VM={vmindex} [STEP13-14] first restart done, open Kitsune + shell for GRANT")
@@ -3720,12 +4302,17 @@ echo FLAGS_DONE
                         result["settings_done"] = True
                     except Exception as exc3:
                         result["detail"] += f" flags_err={exc3}"
+            # 仅真实 installed 才缓存；settings/ih8 真值已在 one_session 写入 result
             self.mark_kitsune_done(
                 vmindex,
                 result["detail"],
                 settings_ok=bool(result.get("settings_done")),
             )
-            self._log(log, f"VM={vmindex} Kitsune Direct Install 成功并缓存")
+            self._log(
+                log,
+                f"VM={vmindex} Kitsune Direct Install 成功并缓存 "
+                f"settings={bool(result.get('settings_done'))} ih8={bool(result.get('ih8_done'))}",
+            )
         else:
             try:
                 self._force_stop_kitsune_home()
@@ -3833,7 +4420,7 @@ echo FLAGS_DONE
         self._log(log, "NekoBox 改配置前先 Stop VPN（改后需重开才生效）")
         try:
             self._open_nekobox_main()
-            time.sleep(0.8)
+            self._sleep_cancelable(0.8)
         except Exception as exc:
             outs.append(f"open_err={exc}")
 
@@ -3842,7 +4429,7 @@ echo FLAGS_DONE
                 xml = self.adb.uiautomator_dump(force=True) or ""
             except Exception as exc:
                 outs.append(f"dump_err={exc}")
-                time.sleep(0.5)
+                self._sleep_cancelable(0.5)
                 continue
             low = (xml or "").lower()
             # 已断开
@@ -3861,13 +4448,13 @@ echo FLAGS_DONE
             ):
                 self.adb.tap_bounds(b)
                 outs.append(f"tap_stop#{i}")
-                time.sleep(1.2)
+                self._sleep_cancelable(1.2)
             else:
                 # 保险再点一次 FAB（若仍有 tun）
                 if self.is_vpn_active(skip_ui=True) and b:
                     self.adb.tap_bounds(b)
                     outs.append(f"tap_fab_force#{i}")
-                    time.sleep(1.2)
+                    self._sleep_cancelable(1.2)
                 else:
                     break
             if not self.is_vpn_active(skip_ui=True):
@@ -4101,7 +4688,7 @@ echo FLAGS_DONE
         # 1) 先打开主界面，保证 intent 投递到前台
         try:
             self._open_nekobox_main()
-            time.sleep(0.8)
+            self._sleep_cancelable(0.8)
             outs.append("main_open")
         except Exception as exc:
             outs.append(f"main_err={exc}")
@@ -4119,14 +4706,14 @@ echo FLAGS_DONE
             outs.append(f"start_err={exc}")
             return " | ".join(outs)[:300]
 
-        time.sleep(1.2)
+        self._sleep_cancelable(1.2)
         confirmed = ""
         for i in range(12):
             try:
                 xml = self.adb.uiautomator_dump(force=True) or ""
             except Exception as exc:
                 outs.append(f"dump_err={exc}")
-                time.sleep(0.5)
+                self._sleep_cancelable(0.5)
                 continue
             low = (xml or "").lower()
             if (
@@ -4142,7 +4729,7 @@ echo FLAGS_DONE
                 )
                 if hit:
                     confirmed = hit
-                    time.sleep(1.0)
+                    self._sleep_cancelable(1.0)
                     continue
                 b = self.adb.find_node_bounds(text_substr="YES", xml=xml)
                 if not b:
@@ -4150,17 +4737,17 @@ echo FLAGS_DONE
                 if b:
                     self.adb.tap_bounds(b)
                     confirmed = "YES_bounds"
-                    time.sleep(1.0)
+                    self._sleep_cancelable(1.0)
                     continue
             else:
                 if confirmed:
                     break
                 if i < 4:
-                    time.sleep(0.6)
+                    self._sleep_cancelable(0.6)
                     continue
                 confirmed = confirmed or "no_dialog"
                 break
-            time.sleep(0.4)
+            self._sleep_cancelable(0.4)
         outs.append(f"confirm={confirmed or 'none'}")
         # 对话框仍在则强点 button1
         try:
@@ -4170,13 +4757,13 @@ echo FLAGS_DONE
                 if b:
                     self.adb.tap_bounds(b)
                     outs.append("force_yes")
-                    time.sleep(0.8)
+                    self._sleep_cancelable(0.8)
         except Exception:
             pass
         # 回到主列表稳定一下，并确认 profile 是否真的出现在列表
         try:
             self._open_nekobox_main()
-            time.sleep(0.6)
+            self._sleep_cancelable(0.6)
         except Exception:
             pass
         try:
@@ -4293,7 +4880,7 @@ echo FLAGS_DONE
             if _in_vpn_consent(xml_now):
                 hit = self.handle_vpn_consent_dialog(xml_now, log=None)
                 outs.append(f"consent_in_recover={hit or 'miss'}")
-                time.sleep(0.8)
+                self._sleep_cancelable(0.8)
                 return _in_nekobox() or bool(hit)
             leave = self._leave_file_manager_and_home()
             outs.append(f"recover={leave}")
@@ -4316,12 +4903,12 @@ echo FLAGS_DONE
                 match_desc=True,
             )
             if hit:
-                time.sleep(0.9)
+                self._sleep_cancelable(0.9)
                 return hit
             b = self.adb.find_node_bounds(resource_id="android:id/button1", xml=xml)
             if b:
                 self.adb.tap_bounds(b)
-                time.sleep(0.9)
+                self._sleep_cancelable(0.9)
                 return "button1"
             return "fail"
 
@@ -4398,12 +4985,12 @@ echo FLAGS_DONE
             if looks_editor or not looks_main_shell:
                 try:
                     self.adb.shell("input", "keyevent", "4", timeout=8)  # BACK
-                    time.sleep(0.7)
+                    self._sleep_cancelable(0.7)
                 except Exception:
                     pass
                 try:
                     self.ensure_nekobox_foreground(log=None)
-                    time.sleep(0.6)
+                    self._sleep_cancelable(0.6)
                 except Exception:
                     pass
                 xml2 = _dump()
@@ -4479,7 +5066,7 @@ echo FLAGS_DONE
                 cy = (y1 + y2) // 2
                 self.adb.tap(cx, cy)
                 outs.append(f"select={profile_name}")
-                time.sleep(0.8)
+                self._sleep_cancelable(0.8)
                 xml = _dump()
                 if _already_connected(xml):
                     outs.append("already_connected")
@@ -4498,7 +5085,7 @@ echo FLAGS_DONE
 
         tap = _tap_connect_fab(xml)
         outs.append(f"tap={tap or 'none'}")
-        time.sleep(1.6)
+        self._sleep_cancelable(1.6)
 
         for round_i in range(10):
             if self._cancelled():
@@ -4515,7 +5102,7 @@ echo FLAGS_DONE
             if _in_vpn_consent(xml):
                 hitc = self.handle_vpn_consent_dialog(xml, log=None)
                 outs.append(f"vpn_consent#{round_i}={hitc or 'miss'}")
-                time.sleep(1.2)
+                self._sleep_cancelable(1.2)
                 continue
             if not _in_nekobox():
                 if not _recover_fg():
@@ -4526,7 +5113,7 @@ echo FLAGS_DONE
                     break
                 continue
             if not xml.strip():
-                time.sleep(0.8)
+                self._sleep_cancelable(0.8)
                 continue
             # 若 dump 到的是文件管理器 UI，不点任何东西
             low_xml = (xml or "").lower()
@@ -4538,11 +5125,11 @@ echo FLAGS_DONE
             d = _dismiss_import(xml)
             if d:
                 outs.append(f"yes_mid={d}")
-                time.sleep(0.7)
+                self._sleep_cancelable(0.7)
                 continue
             if _already_connected(xml):
                 outs.append("connected")
-                time.sleep(1.0)
+                self._sleep_cancelable(1.0)
                 if self.is_vpn_active(skip_ui=True):
                     outs.append("tun_up")
                 break
@@ -4550,7 +5137,7 @@ echo FLAGS_DONE
             if _in_vpn_consent(xml) or self._xml_looks_like_vpn_consent(xml):
                 hitc = self.handle_vpn_consent_dialog(xml, log=None)
                 outs.append(f"vpn_consent_loop={hitc or 'miss'}")
-                time.sleep(1.1)
+                self._sleep_cancelable(1.1)
                 continue
             low_perm = (xml or "").lower()
             if "i trust this application" in low_perm or "connection request" in low_perm:
@@ -4572,15 +5159,15 @@ echo FLAGS_DONE
                 )
                 if hit:
                     outs.append(f"perm={hit}")
-                    time.sleep(1.1)
+                    self._sleep_cancelable(1.1)
                     continue
             if not _already_connected(xml):
                 tap2 = _tap_connect_fab(xml)
                 if tap2 and tap2 not in ("already_stop", "no_fab") and not str(tap2).startswith("skip_"):
                     outs.append(f"fab_retry={round_i}:{tap2}")
-                    time.sleep(1.3)
+                    self._sleep_cancelable(1.3)
                     # Connect 后立刻再抓一次授权弹窗
-                    time.sleep(0.5)
+                    self._sleep_cancelable(0.5)
                     xml2 = _dump()
                     if _in_vpn_consent(xml2):
                         hitc = self.handle_vpn_consent_dialog(xml2, log=None)
@@ -4591,7 +5178,7 @@ echo FLAGS_DONE
                     # 再 BACK + 回主界面，避免卡在 profile 编辑页
                     try:
                         self.adb.shell("input", "keyevent", "4", timeout=8)
-                        time.sleep(0.5)
+                        self._sleep_cancelable(0.5)
                     except Exception:
                         pass
                     if not _recover_fg():
@@ -4816,7 +5403,7 @@ echo FLAGS_DONE
         self._open_nekobox_main()
         if not self._open_profile_edit(profile_name):
             return ""
-        time.sleep(0.8)
+        self._sleep_cancelable(0.8)
         xml = self.adb.uiautomator_dump(force=True) or ""
         # 找 Username (Optional) 后的 summary
         m = re.search(
@@ -4946,21 +5533,21 @@ echo FLAGS_DONE
         )
         if hit:
             self._log(log, f"VPN 授权点击: {hit}")
-            time.sleep(1.2)
+            self._sleep_cancelable(1.2)
             return hit
         # button1 通常是正向按钮
         b = self.adb.find_node_bounds(resource_id="android:id/button1", xml=xml)
         if b:
             self.adb.tap_bounds(b)
             self._log(log, "VPN 授权点击: button1")
-            time.sleep(1.2)
+            self._sleep_cancelable(1.2)
             return "button1"
         # 再试 button_positive
         b2 = self.adb.find_node_bounds(resource_id="android:id/button_positive", xml=xml)
         if b2:
             self.adb.tap_bounds(b2)
             self._log(log, "VPN 授权点击: button_positive")
-            time.sleep(1.2)
+            self._sleep_cancelable(1.2)
             return "button_positive"
         self._log(log, f"VPN 授权界面未找到 OK/Allow fg={pkg}")
         return ""
@@ -4981,7 +5568,7 @@ echo FLAGS_DONE
                 outs.append("back")
             except Exception:
                 pass
-            time.sleep(0.25)
+            self._sleep_cancelable(0.25)
             pkg2 = self.current_foreground_pkg().lower()
             if not self._is_file_manager_pkg(pkg2):
                 break
@@ -4995,7 +5582,7 @@ echo FLAGS_DONE
                 outs.append("home")
             except Exception:
                 pass
-            time.sleep(0.4)
+            self._sleep_cancelable(0.4)
         return "|".join(outs) or "noop"
 
     def ensure_nekobox_foreground(self, *, log: LogFn = None) -> bool:
@@ -5045,7 +5632,7 @@ echo FLAGS_DONE
                     self._log(log, f"NekoBox am start: {(o1 or '').strip().replace(chr(10), ' ')[:80]}")
             except Exception as exc:
                 self._log(log, f"NekoBox am start err: {exc}")
-            time.sleep(1.2)
+            self._sleep_cancelable(1.2)
             pkg = self.current_foreground_pkg().lower()
             if self.nekobox_pkg.lower() in pkg:
                 return True
@@ -5060,7 +5647,7 @@ echo FLAGS_DONE
         if not self.is_nekobox_installed():
             return
         self.ensure_nekobox_foreground(log=None)
-        time.sleep(0.3)
+        self._sleep_cancelable(0.3)
 
     def _open_profile_edit(self, profile_name: str) -> bool:
         """在主列表点对应 profile 行的 Edit。"""
@@ -5105,7 +5692,7 @@ echo FLAGS_DONE
         if not edit_b:
             return False
         self.adb.tap_bounds(edit_b)
-        time.sleep(1.0)
+        self._sleep_cancelable(1.0)
         return True
 
     def _set_preference_text(self, title_substr: str, value: str, xml: str = "") -> str:
@@ -5156,12 +5743,12 @@ echo FLAGS_DONE
                 self.adb.swipe(720, 2000, 720, 900, 350)
             except Exception:
                 pass
-            time.sleep(0.5)
+            self._sleep_cancelable(0.5)
             xml = self.adb.uiautomator_dump(force=True) or ""
         if not b:
             return f"miss_title={title_substr}"
         self.adb.tap_bounds(b)
-        time.sleep(0.8)
+        self._sleep_cancelable(0.8)
         dlg = self.adb.uiautomator_dump(force=True) or ""
         eb = self.adb.find_node_bounds(resource_id="android:id/edit", class_endswith="EditText", xml=dlg)
         if not eb:
@@ -5169,7 +5756,7 @@ echo FLAGS_DONE
         if not eb:
             return "no_edittext"
         self.adb.tap_bounds(eb)
-        time.sleep(0.2)
+        self._sleep_cancelable(0.2)
         try:
             self.adb.clear_field(times=max(40, len(value) + 10))
         except Exception:
@@ -5178,7 +5765,7 @@ echo FLAGS_DONE
             self.adb.input_text_safe(value)
         except Exception as exc:
             return f"input_err={exc}"
-        time.sleep(0.3)
+        self._sleep_cancelable(0.3)
         hit = self.adb.tap_any(["OK", "Ok", "确定", "Apply", "保存"], xml=self.adb.uiautomator_dump(force=True) or "", match_text=True)
         if not hit:
             b1 = self.adb.find_node_bounds(resource_id="android:id/button1")
@@ -5187,7 +5774,7 @@ echo FLAGS_DONE
                 hit = "button1"
             else:
                 return "no_ok"
-        time.sleep(0.5)
+        self._sleep_cancelable(0.5)
         return f"set={title_substr}:{hit}"
 
     def fix_nekobox_profile_auth_ui(
@@ -5227,7 +5814,7 @@ echo FLAGS_DONE
                 self.adb.tap_bounds(b)
                 hit = "Apply_bounds"
         outs.append(f"apply={hit or 'none'}")
-        time.sleep(0.8)
+        self._sleep_cancelable(0.8)
         # 回主页
         try:
             self.adb.shell("input", "keyevent", "4", timeout=8)
@@ -5241,7 +5828,7 @@ echo FLAGS_DONE
         if xml is None:
             try:
                 self._open_nekobox_main()
-                time.sleep(0.35)
+                self._sleep_cancelable(0.35)
                 xml = self.adb.uiautomator_dump(force=True) or ""
             except Exception:
                 return []
@@ -5294,7 +5881,7 @@ echo FLAGS_DONE
         outs: list[str] = []
         try:
             self._open_nekobox_main()
-            time.sleep(0.4)
+            self._sleep_cancelable(0.4)
         except Exception as exc:
             return f"open_err={exc}"
 
@@ -5316,7 +5903,7 @@ echo FLAGS_DONE
                 self._open_nekobox_main()
             except Exception:
                 pass
-            time.sleep(0.25)
+            self._sleep_cancelable(0.25)
             xml = ""
             try:
                 xml = self.adb.uiautomator_dump(force=True) or ""
@@ -5380,7 +5967,7 @@ echo FLAGS_DONE
                         outs.append(f"fallback_delete_{target_name}={one}")
                         if one.startswith("removed=") or "tapped" in one:
                             deleted += 1
-                            time.sleep(0.45)
+                            self._sleep_cancelable(0.45)
                             continue
                     except Exception as exc:
                         outs.append(f"fallback_err={exc}")
@@ -5392,7 +5979,7 @@ echo FLAGS_DONE
             except Exception as exc:
                 outs.append(f"tap_remove_err={exc}")
                 break
-            time.sleep(0.55)
+            self._sleep_cancelable(0.55)
             xml2 = ""
             try:
                 xml2 = self.adb.uiautomator_dump(force=True) or ""
@@ -5415,13 +6002,13 @@ echo FLAGS_DONE
                 log,
                 f"NekoBox 删除 profile#{deleted} name={target_name or '?'} confirm={hit or 'tapped'}",
             )
-            time.sleep(0.45)
+            self._sleep_cancelable(0.45)
 
         # 终态再确认
         left: list[str] = []
         try:
             self._open_nekobox_main()
-            time.sleep(0.3)
+            self._sleep_cancelable(0.3)
             left = self.list_nekobox_profile_names_ui()
         except Exception:
             left = []
@@ -5471,7 +6058,7 @@ echo FLAGS_DONE
         if not rem_b:
             return "remove_btn_miss"
         self.adb.tap_bounds(rem_b)
-        time.sleep(0.7)
+        self._sleep_cancelable(0.7)
         xml2 = self.adb.uiautomator_dump(force=True) or ""
         hit = self.adb.tap_any(["OK", "Yes", "YES", "确定", "删除", "Remove"], xml=xml2, match_text=True)
         if not hit:
@@ -5479,7 +6066,7 @@ echo FLAGS_DONE
             if b1:
                 self.adb.tap_bounds(b1)
                 hit = "button1"
-        time.sleep(0.6)
+        self._sleep_cancelable(0.6)
         return f"removed={hit or 'tapped'}"
 
 
@@ -5515,7 +6102,7 @@ echo FLAGS_DONE
         if xml is None:
             try:
                 self._open_nekobox_main()
-                time.sleep(0.4)
+                self._sleep_cancelable(0.4)
                 xml = self.adb.uiautomator_dump(force=True) or ""
             except Exception:
                 return False
@@ -5551,7 +6138,7 @@ echo FLAGS_DONE
         ui_ok = False
         try:
             self._open_nekobox_main()
-            time.sleep(0.35)
+            self._sleep_cancelable(0.35)
             xml = self.adb.uiautomator_dump(force=True) or ""
             if (xml or "").strip():
                 ui_ok = True
@@ -5665,10 +6252,10 @@ echo FLAGS_DONE
                     if self._is_vpn_consent_pkg(self.current_foreground_pkg()) or self._xml_looks_like_vpn_consent(xml):
                         hitc = self.handle_vpn_consent_dialog(xml, log=log)
                         outs.append(f"consent_wait={hitc or 'miss'}")
-                        time.sleep(1.0)
+                        self._sleep_cancelable(1.0)
                         continue
                     if 'content-desc="stop"' in low or "connected, tap" in low:
-                        time.sleep(1.0)
+                        self._sleep_cancelable(1.0)
                         if self.is_vpn_active(skip_ui=True):
                             vpn_ok = True
                             break
@@ -5682,7 +6269,7 @@ echo FLAGS_DONE
                         )
                         if hit:
                             outs.append(f"wait_perm={hit}")
-                            time.sleep(1.0)
+                            self._sleep_cancelable(1.0)
                             continue
                         hit2 = self.adb.tap_any(
                             ["Connect", "连接"],
@@ -5697,7 +6284,7 @@ echo FLAGS_DONE
                                 outs.append("wait_fab")
                 except Exception:
                     pass
-                time.sleep(1.3)
+                self._sleep_cancelable(1.3)
             if vpn_ok:
                 break
             self._log(log, f"NekoBox round={round_i} 未检测到 tun，重试 Connect")
@@ -5712,7 +6299,7 @@ echo FLAGS_DONE
             ):
                 hitc = self.handle_vpn_consent_dialog(log=log)
                 outs.append(f"consent_final={hitc or 'miss'}")
-                time.sleep(1.5)
+                self._sleep_cancelable(1.5)
                 if self.is_vpn_active(skip_ui=True):
                     vpn_ok = True
                     outs.append("vpn_active=True")
@@ -5776,7 +6363,7 @@ echo FLAGS_DONE
                 f"{self.nekobox_pkg}/io.nekohasekai.sagernet.ui.MainActivity",
                 timeout=15,
             )
-            time.sleep(0.8)
+            self._sleep_cancelable(0.8)
             outs.append("opened")
             self._log(log, "NekoBox 已打开 MainActivity")
         except Exception as exc:
@@ -5820,7 +6407,7 @@ echo FLAGS_DONE
 
         # 4) HOME，保持 VPN 后台（绝不 force-stop NekoBox）
         try:
-            time.sleep(0.3)
+            self._sleep_cancelable(0.3)
             self.adb.shell("input", "keyevent", "3", timeout=8)
             outs.append("home_ok")
         except Exception as exc:
@@ -5866,6 +6453,53 @@ echo FLAGS_DONE
         want_venmo = bool(opts.get("venmo", True))
         out: dict[str, str] = {"vmindex": str(vmindex)}
 
+        # instant-stop-v2-try
+        try:
+            return self._provision_new_vm_run(
+                vmindex,
+                out=out,
+                opts=opts,
+                want_kitsune=want_kitsune,
+                want_nekobox=want_nekobox,
+                want_ih8=want_ih8,
+                want_aurora=want_aurora,
+                want_venmo=want_venmo,
+                log=log,
+                boot_timeout=boot_timeout,
+                prefer_aurora_venmo=prefer_aurora_venmo,
+                restart_after_module=restart_after_module,
+            )
+        except TaskCancelled:
+            out["status"] = "cancelled"
+            try:
+                self._log(log, f"VM={vmindex} provision 已取消(TaskCancelled)")
+            except Exception:
+                pass
+            try:
+                self.adb.release_ui_control(home=False)
+            except Exception:
+                pass
+            return out
+
+    def _provision_new_vm_run(
+        self,
+        vmindex: int,
+        *,
+        out: dict,
+        opts: dict,
+        want_kitsune: bool,
+        want_nekobox: bool,
+        want_ih8: bool,
+        want_aurora: bool,
+        want_venmo: bool,
+        log=None,
+        boot_timeout: int = 240,
+        prefer_aurora_venmo: bool = False,
+        restart_after_module: bool = True,
+    ) -> dict:
+        """provision 原流程主体；停止时抛 TaskCancelled 由外层捕获。"""
+        from core.venmo_install import ensure_aurora, ensure_venmo_ready
+
         self._log(log, f"VM={vmindex} provision 开始 opts={opts}")
         if self._cancelled():
             out["status"] = "cancelled"
@@ -5880,11 +6514,13 @@ echo FLAGS_DONE
             out["status"] = "cancelled"
             return out
         # 新建机首启：先等 MuMu Store 同步完成，再装包/Kitsune
+        self._log(log, f"VM={vmindex} provision START parallel-ready")
         try:
+            # 10路并行时不宜每台空等 240s；商店同步最多 75s，超时仍继续装包
             out["mumu_store"] = self.wait_mumu_store_sync(
                 log=log,
-                timeout=min(240, max(60, int(boot_timeout))),
-                idle_stable_seconds=4.0,
+                timeout=min(15, max(10, int(boot_timeout) // 30 or 12)),
+                idle_stable_seconds=1.5,
                 force_close_after=True,
             )
         except Exception as exc:
@@ -5934,12 +6570,17 @@ echo FLAGS_DONE
             try:
                 # 新建：一次会话完成 DirectInstall + Shell授权 + Settings三项 + ih8
                 # 见 Uninstall Magisk 后直接授权，中途不 force-stop Magisk 再重开
-                mag = self.ensure_kitsune_magisk_direct_install(
+                mag = self._with_magisk_ui_slot(
+                    vmindex,
+                    log,
+                    boot_timeout,
+                    lambda: self.ensure_kitsune_magisk_direct_install(
                     vmindex,
                     log=log,
                     boot_timeout=boot_timeout,
                     configure_settings=True,
                     install_ih8=bool(want_ih8),
+                    ),
                 )
                 out["magisk"] = str(mag)[:400]
                 rebooted = bool(mag.get("rebooted"))
@@ -6093,12 +6734,17 @@ echo FLAGS_DONE
         mag: dict = {}
         if want_kitsune:
             # 新建完整 setup：一次会话完成 DirectInstall后的 Shell+Settings+ih8
-            mag = self.ensure_kitsune_magisk_direct_install(
+            mag = self._with_magisk_ui_slot(
+                vmindex,
+                log,
+                boot_timeout,
+                lambda: self.ensure_kitsune_magisk_direct_install(
                 vmindex,
                 log=log,
                 boot_timeout=boot_timeout,
                 configure_settings=True,
                 install_ih8=want_ih8,
+                ),
             )
             out["magisk"] = str(mag)[:400]
             if mag.get("rebooted"):
@@ -6178,3 +6824,4 @@ echo FLAGS_DONE
                 verify_vpn=True,
             )
         return out
+

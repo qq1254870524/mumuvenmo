@@ -1,3 +1,4 @@
+# 2026-07-31 play-sign-in-bail-v1: Aurora 误进 Play 登录页立即退出，禁止空转 420s 挡住 Magisk 后半段
 # -*- coding: utf-8 -*-
 """Venmo 安装：禁止单包 base.apk，优先完整 split install-multiple，其次 Aurora Store。
 
@@ -695,7 +696,6 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
     # 打开 Venmo 详情
     for args in (
         ["am", "start", "-a", "android.intent.action.VIEW", "-d", "market://details?id=com.venmo", AURORA_PKG],
-        ["am", "start", "-a", "android.intent.action.VIEW", "-d", "https://play.google.com/store/apps/details?id=com.venmo", AURORA_PKG],
         ["am", "start", "-a", "android.intent.action.SEARCH", "--es", "query", "Venmo", AURORA_PKG],
     ):
         try:
@@ -735,9 +735,10 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
         except Exception:
             pass
 
-    # 安装循环
-    deadline = time.time() + 420
+    # 安装循环（play-sign-in-bail-v1: 误进 Play 登录页立刻退出，默认最多 90s）
+    deadline = time.time() + 90
     last_tap = ""
+    play_signin_hits = 0
     while time.time() < deadline:
         info = venmo_split_info(adb)
         if info.get("complete"):
@@ -753,6 +754,22 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
             notes.append("d:" + d[:40])
         # 账号页再次 Anonymous
         ui = _dump_text(adb)
+        # Play Store 登录页：不是 Aurora，空转无意义
+        if any(k in ui for k in ("sign in", "sign-in", "add account", "google play", "使用 google 账号")) or (
+            "com.android.vending" in ui and "venmo" not in ui
+        ):
+            play_signin_hits += 1
+            notes.append("play_signin")
+            try:
+                adb.shell("am", "force-stop", "com.android.vending", timeout=5)
+                adb.shell("input", "keyevent", "3", timeout=5)
+            except Exception:
+                pass
+            if play_signin_hits >= 2:
+                _log(log, "Aurora path hit Play Store sign-in -> bail (not blocking Magisk)")
+                break
+            time.sleep(0.8)
+            continue
         if "anonymous" in ui or "匿名" in ui:
             if _tap_first_exact(adb, ["Anonymous", "匿名"]):
                 notes.append("anon_again")

@@ -1,3 +1,5 @@
+# 2026-07-31 engine-version-v1: create 强制 --version 已装引擎(12)，60014 自动重试 auto/12
+# 2026-07-31 instant-stop-v2: launch_and_wait 支持 cancel_check 秒退
 # 2026-07-25 kitsune-cache-recreate-v1.1: 修复 DATA_STATE_DIR 局部导入 NameError； create/delete 清理 kitsune_ok_vmN.json，防索引复用误跳过
 # 2026-07-25 rename-ui-notify-v1: 改名写磁盘后短超时 rename API，MuMuPlayer 实时刷新；磁盘已正确也通知 UI
 # 2026-07-25 layout-boot-win32-v1: 启动后立即一字排列；纯Win32定位(不占MuMuManager锁)；窗口标题强制序号
@@ -425,22 +427,111 @@ class MuMuManager:
             pass
         return used
 
+    def detect_preferred_android_version(self) -> str:
+        """检测本机已安装的 Android 引擎版本，供 create --version 使用。
+
+        MuMu 6.3+ create 支持 auto/12/15。升级后若默认走 15 但本机只有 12，
+        会返回 errcode=60014 android engine not installed。
+        优先读 install_config.engines.*.player.android_version 与 nx_device/*/vms/*base*。
+        """
+        root = self.manager.parent.parent  # nx_main -> MuMuPlayer
+        found: list[str] = []
+
+        # 1) install_config.json engines
+        for rel in (
+            Path("configs") / "install_config.json",
+            Path("configs") / "main" / "install_config.json",
+        ):
+            fp = root / rel
+            if not fp.exists():
+                continue
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            engines = data.get("engines") if isinstance(data, dict) else None
+            if not isinstance(engines, dict):
+                continue
+            for _name, eng in engines.items():
+                if not isinstance(eng, dict):
+                    continue
+                player = eng.get("player") if isinstance(eng.get("player"), dict) else {}
+                av = str(player.get("android_version") or "").strip()
+                if not av:
+                    continue
+                major = av.split(".")[0].strip()
+                if major.isdigit():
+                    found.append(major)
+
+        # 2) nx_device/<ver>/vms/*base*
+        nx = root / "nx_device"
+        if nx.is_dir():
+            try:
+                for child in sorted(nx.iterdir()):
+                    if not child.is_dir():
+                        continue
+                    name = child.name.strip()
+                    major = name.split(".")[0]
+                    if not major.isdigit():
+                        continue
+                    vms = child / "vms"
+                    has_base = False
+                    if vms.is_dir():
+                        try:
+                            for f in vms.iterdir():
+                                if "base" in f.name.lower():
+                                    has_base = True
+                                    break
+                        except Exception:
+                            pass
+                    # 只有真正有 base 镜像才算已安装；15.0 空壳不算
+                    if has_base:
+                        found.append(major)
+            except Exception:
+                pass
+
+        uniq: list[str] = []
+        for v in found:
+            if v not in uniq:
+                uniq.append(v)
+        if "12" in uniq:
+            return "12"
+        if uniq:
+            return uniq[0]
+        return "12"
+
     def create(
         self,
         number: int = 1,
         mini: bool = True,
         vmindex: int | str | None = None,
         timeout: int = 45,
+        version: str | int | None = None,
     ) -> subprocess.CompletedProcess:
         """创建模拟器（短超时）。
         必须带 --vmindex 指定空闲索引；裸 create 或超时残留 manager 会卡 MuMu 主界面。
         成功返回后不杀 manager（避免误杀并发命令）；超时由 _run 杀树。
+        version: Android 引擎 auto/12/15；None 时自动检测本机已装引擎（避免 60014）。
         """
         args = ["create", "--number", str(max(1, int(number)))]
         if vmindex is not None and str(vmindex) != "":
             args.extend(["--vmindex", str(vmindex)])
         if mini:
             args.append("--mini")
+        ver = str(version).strip() if version is not None and str(version).strip() != "" else ""
+        if not ver:
+            try:
+                ver = str(self.detect_preferred_android_version() or "12")
+            except Exception:
+                ver = "12"
+        # MuMu create --version 接受 auto/12/15
+        major = ver.split(".")[0]
+        if ver.lower() == "auto":
+            args.extend(["--version", "auto"])
+        elif major.isdigit():
+            args.extend(["--version", major])
+        else:
+            args.extend(["--version", "12"])
         return self._run(args, timeout=timeout)
 
     def delete(self, vmindex: str | int = "all") -> subprocess.CompletedProcess:
@@ -760,6 +851,26 @@ class MuMuManager:
         defaults = defaults or {}
         need = max(1, int(number))
         mini = bool(defaults.get("mini_disk", True))
+        # engine-version-v1: 显式指定已装 Android 引擎，避免升级后默认 15 导致 60014
+        raw_ver = (
+            defaults.get("android_version")
+            or defaults.get("engine_version")
+            or defaults.get("create_version")
+        )
+        if raw_ver is not None and str(raw_ver).strip() != "":
+            android_ver = str(raw_ver).strip()
+            if android_ver not in ("auto", "12", "15") and android_ver.split(".")[0].isdigit():
+                android_ver = android_ver.split(".")[0]
+        else:
+            try:
+                android_ver = self.detect_preferred_android_version()
+            except Exception:
+                android_ver = "12"
+        android_ver_fallbacks: list[str] = []
+        for cand in (android_ver, "12", "auto", "15"):
+            c = str(cand).strip()
+            if c and c not in android_ver_fallbacks:
+                android_ver_fallbacks.append(c)
 
         def _cancelled() -> bool:
             try:
@@ -783,7 +894,8 @@ class MuMuManager:
 
         self._log(
             log,
-            f"创建 {need} 个模拟器 mini={mini} free_targets={targets} before={sorted(before)} fs={self.list_indices_fs()}",
+            f"创建 {need} 个模拟器 mini={mini} android_version={android_ver} "
+            f"fallbacks={android_ver_fallbacks} free_targets={targets} before={sorted(before)} fs={self.list_indices_fs()}",
         )
 
         new_ids: list[int] = []
@@ -806,8 +918,13 @@ class MuMuManager:
             if target in before:
                 continue
             try:
-                self._log(log, f"create --vmindex {target} --number 1 mini={mini}")
-                cp = self.create(number=1, mini=mini, vmindex=target, timeout=45)
+                self._log(
+                    log,
+                    f"create --vmindex {target} --number 1 mini={mini} version={android_ver}",
+                )
+                cp = self.create(
+                    number=1, mini=mini, vmindex=target, timeout=45, version=android_ver
+                )
                 out = ((cp.stdout or "") + (cp.stderr or "")).strip()
                 self._log(log, f"create vmindex={target} rc={cp.returncode} out={out[:180]}")
                 parsed = self._parse_create_result(out)
@@ -822,6 +939,40 @@ class MuMuManager:
                     except Exception:
                         errcode = -1
                     errmsg = str(node.get("errmsg") or "")
+                # 60014: android engine not installed — 同索引换 version 重试
+                if errcode == 60014 or "android engine not installed" in errmsg.lower():
+                    for alt in android_ver_fallbacks:
+                        if _cancelled():
+                            break
+                        if alt == android_ver:
+                            continue
+                        self._log(
+                            log,
+                            f"create vmindex={target} 60014，改用 --version {alt} 重试",
+                        )
+                        cp = self.create(
+                            number=1, mini=mini, vmindex=target, timeout=45, version=alt
+                        )
+                        out = ((cp.stdout or "") + (cp.stderr or "")).strip()
+                        self._log(
+                            log,
+                            f"create vmindex={target} retry version={alt} rc={cp.returncode} out={out[:180]}",
+                        )
+                        parsed = self._parse_create_result(out)
+                        node = parsed.get(int(target))
+                        if node is None and parsed:
+                            node = next(iter(parsed.values()))
+                        errcode = 0
+                        errmsg = ""
+                        if isinstance(node, dict):
+                            try:
+                                errcode = int(node.get("errcode", 0) or 0)
+                            except Exception:
+                                errcode = -1
+                            errmsg = str(node.get("errmsg") or "")
+                        if errcode == 0:
+                            android_ver = alt  # 后续 create 沿用成功版本
+                            break
                 if errcode != 0:
                     self._log(
                         log,
@@ -868,7 +1019,8 @@ class MuMuManager:
             self._log(
                 log,
                 f"create 仅得到 {len(new_ids)}/{need}，不再 clone 兜底（防主界面卡死） "
-                f"before={sorted(before)} fs={self.list_indices_fs()} new={new_ids}",
+                f"android_version={android_ver} before={sorted(before)} fs={self.list_indices_fs()} new={new_ids} "
+                f"提示: 若全是 60014，请确认 MuMu 已安装 Android 引擎(本机通常为 12)",
             )
 
         new_ids = sorted(set(new_ids))[:need]
@@ -913,9 +1065,11 @@ class MuMuManager:
         return self._run(["control", "--vmindex", str(vmindex), "shutdown"], timeout=120)
 
     def restart(self, vmindex: int | str) -> subprocess.CompletedProcess:
-        """只能用模拟器 restart device。"""
+        """只能用模拟器 restart device。
+        2026-07-31: 超时 25->12，避免 10 路并行时 manager 全局锁被单台 restart 占太久。
+        """
         try:
-            return self._run(["control", "--vmindex", str(vmindex), "restart"], timeout=25)
+            return self._run(["control", "--vmindex", str(vmindex), "restart"], timeout=12)
         except TimeoutError:
             logger.info("restart cmd timeout, continue wait via info vm=%s", vmindex)
             return self._dummy_ok("restart_timeout_continue")
@@ -1563,13 +1717,23 @@ class MuMuManager:
         log: LogFn = None,
         recover: bool = True,
         stuck_seconds: int = 75,
+        cancel_check=None,
     ) -> bool:
         """等待 Android 启动；长时间停留 starting_rom 则自动恢复。"""
+        def _cancelled() -> bool:
+            try:
+                return bool(callable(cancel_check) and cancel_check())
+            except Exception:
+                return False
+
         deadline = time.time() + timeout
         starting_since: float | None = None
         recovered = False
         last_log = 0.0
         while time.time() < deadline:
+            if _cancelled():
+                self._log(log, f"VM={vmindex} Android 等待已取消")
+                return False
             try:
                 node = self._node(vmindex)
                 android = bool(node.get("is_android_started"))
@@ -1621,7 +1785,13 @@ class MuMuManager:
                         starting_since = None
             except Exception as exc:
                 logger.debug("wait_android info error: %s", exc)
-            time.sleep(2.5)
+            # instant-stop-v2: 2.5s 可取消短睡
+            end = time.time() + 2.5
+            while time.time() < end:
+                if _cancelled():
+                    self._log(log, f"VM={vmindex} Android 等待已取消")
+                    return False
+                time.sleep(0.2)
         self._log(log, f"VM={vmindex} Android 启动超时 {timeout}s")
         return False
 
@@ -1632,6 +1802,7 @@ class MuMuManager:
         defaults: dict[str, Any] | None = None,
         log: LogFn = None,
         ensure_settings: bool = True,
+        cancel_check=None,
     ) -> bool:
         """确保设置正确后启动并等待 Android。
 
@@ -1642,6 +1813,16 @@ class MuMuManager:
         - 快速路径必须同时满足 MuMu is_android_started + 正确 adb_port + boot_completed
         - 禁止仅凭残留 adb devices/假端口误判“已就绪”而跳过 launch（VM5 假阳性根因）
         """
+        def _cancelled() -> bool:
+            try:
+                return bool(callable(cancel_check) and cancel_check())
+            except Exception:
+                return False
+
+        if _cancelled():
+            self._log(log, f"VM={vmindex} launch_and_wait 已取消(开始前)")
+            return False
+
         # 快速路径：MuMu 已 android_started 且端口可连 boot_completed=1，不再二次 launch
         if self._adb_boot_ready(vmindex, tries=2):
             self._log(log, f"VM={vmindex} Android+ADB 已就绪，跳过重复 launch")
@@ -1667,6 +1848,7 @@ class MuMuManager:
             defaults=defaults,
             log=log,
             recover=True,
+            cancel_check=cancel_check,
         )
         if not ok:
             return False
@@ -1676,9 +1858,18 @@ class MuMuManager:
         self._log(log, f"VM={vmindex} Android started 但 ADB 未就绪，继续等 ADB")
         deadline = time.time() + min(60, max(15, int(timeout) // 4))
         while time.time() < deadline:
+            if _cancelled():
+                self._log(log, f"VM={vmindex} launch_and_wait 已取消(ADB等待)")
+                return False
             if self._adb_boot_ready(vmindex, tries=1, require_android_started=True):
                 return True
-            time.sleep(2.0)
+            # instant-stop-v2: 可取消短睡
+            end = time.time() + 2.0
+            while time.time() < end:
+                if _cancelled():
+                    self._log(log, f"VM={vmindex} launch_and_wait 已取消(ADB等待)")
+                    return False
+                time.sleep(0.2)
         self._log(log, f"VM={vmindex} Android started 后 ADB 仍未就绪")
         return False
 
@@ -1837,7 +2028,10 @@ class MuMuManager:
                 defaults=defaults,
                 log=log,
                 ensure_settings=True,
+                cancel_check=cancel_check,
             )
+            if _cancelled():
+                return idx, False
             try:
                 self.ensure_index_player_name(idx, str(int(idx)), retries=2, delay=0.2, log=log)
             except Exception as exc:
@@ -1848,22 +2042,35 @@ class MuMuManager:
                 pass
             return idx, ok
 
-        with ThreadPoolExecutor(max_workers=workers) as ex:
+        # instant-stop-v2: wait 轮询，避免 as_completed 卡在已运行 future 上
+        from concurrent.futures import wait, FIRST_COMPLETED
+        ex = ThreadPoolExecutor(max_workers=workers)
+        try:
             futs = [ex.submit(_one, i) for i in new_ids]
-            for fut in as_completed(futs):
-                try:
-                    idx, ok = fut.result()
-                    results[idx] = ok
-                except Exception as exc:
-                    self._log(log, f"启动任务异常: {exc}")
+            pending = set(futs)
+            while pending:
                 if _cancelled():
                     self._log(log, "create_and_launch: 启动阶段已取消")
-                    for f in futs:
+                    for f in list(pending):
                         try:
                             f.cancel()
                         except Exception:
                             pass
                     break
+                done, pending = wait(pending, timeout=0.3, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for fut in done:
+                    try:
+                        idx, ok = fut.result(timeout=0)
+                        results[idx] = ok
+                    except Exception as exc:
+                        self._log(log, f"启动任务异常: {exc}")
+        finally:
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                ex.shutdown(wait=False)
         out = {"new_ids": new_ids, "boot": results}
         if _cancelled():
             out["cancelled"] = True

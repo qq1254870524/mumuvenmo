@@ -1,3 +1,5 @@
+# 2026-07-31 zombie-cancel-v2: Event代际 + provision捕获cancel，旧线程不因clear复活
+# 2026-07-31 instant-stop-v2: 停止任务秒级生效(wait轮询+脉冲杀adb+跳过收尾)
 # 2026-07-25 stop-task-force-v1: 顶栏【■ 停止任务】强制中断新建/装包/后台任务；_run_bg 可取消
 # 2026-07-25 gui-layout-two-row-v2: 窗口恢复1080x700；参数/操作按钮仍两行完整显示
 # 2026-07-25 layout-boot-immediate-v1: 新建启动成功后立刻一字排列，不等待装包结束
@@ -20,6 +22,10 @@ MuMu Venmo 多开登录器 UI（紧凑顶栏：开始/停止始终可见）
 - GUI 自定义：登录并发、新建数量、新建启动线程
 """
 from __future__ import annotations
+
+# 2026-07-31 concurrent-create-v1
+# 2026-07-31 heavy-install-v1+immediate-stop-v1: 错峰0.45; 停止杀adb; pool shutdown cancel: 新建装包 10 路真正并行；提交即打 START；轻微错峰减 ADB 惊群
+# 2026-07-31 zombie-cancel-v1: 新任务用新 cancel Event，避免旧装包线程复活
 
 import os
 import time
@@ -1025,7 +1031,7 @@ class App(tk.Tk):
             _apply()
 
     def stop_task(self) -> None:
-        """强制中断后台任务（新建/装包/启动/删除/排列等），立即发取消信号。"""
+        """强制中断后台任务（新建/装包/启动/删除/排列等），立即发取消信号并杀 adb。"""
         if not getattr(self, "_busy", False):
             self._log("停止任务: 当前没有后台任务")
             return
@@ -1035,7 +1041,38 @@ class App(tk.Tk):
         except Exception as exc:
             self._log(f"停止任务: 发送取消信号失败: {exc}")
             return
-        self._log(f"[停止任务] 已强制中断 → {title}（正在进行的步骤会尽快退出）")
+        # instant-stop-v2: 立刻 + 脉冲打断卡住的 adb install/push/ui dump
+        try:
+            from core.adb_client import AdbClient
+            AdbClient.request_cancel_all()
+            killed = AdbClient.interrupt_all()
+            self._log(f"[停止任务] 已中断活动 ADB 进程 killed={killed}")
+        except Exception as exc:
+            self._log(f"[停止任务] 中断 ADB 失败: {exc}")
+        self._log(f"[停止任务] 已强制中断 → {title}（目标 <1s 退出当前步骤）")
+
+        def _pulse_kill() -> None:
+            try:
+                from core.adb_client import AdbClient as _Adb
+            except Exception:
+                return
+            for _i in range(40):  # ~12s
+                try:
+                    if not getattr(self, "_busy", False):
+                        break
+                    ev = getattr(self, "_bg_cancel", None)
+                    if ev is None or not ev.is_set():
+                        break
+                    _Adb.request_cancel_all()
+                    _Adb.interrupt_all()
+                except Exception:
+                    pass
+                time.sleep(0.3)
+
+        try:
+            threading.Thread(target=_pulse_kill, name="stop-task-pulse", daemon=True).start()
+        except Exception:
+            pass
         btn = getattr(self, "btn_stop_task", None)
         if btn is not None:
             try:
@@ -1057,24 +1094,31 @@ class App(tk.Tk):
             return
         self._busy = True
         self._bg_title = str(title or "后台任务")
+        # zombie-cancel-v2: 每次任务换新 Event + 代际号。
+        # 旧任务 Event 保持 set；即便 clear_cancel_all，旧线程因 bg_gen 不匹配也会退出。
+        self._bg_gen = int(getattr(self, "_bg_gen", 0) or 0) + 1
+        self._bg_cancel = threading.Event()
+        cancel_ev = self._bg_cancel
+        bg_gen = self._bg_gen
         try:
-            self._bg_cancel.clear()
+            from core.adb_client import AdbClient
+            AdbClient.clear_cancel_all()
         except Exception:
-            self._bg_cancel = threading.Event()
+            pass
         self._log(f"[{title}] 开始...（可点顶栏【■ 停止任务】强制中断）")
         self._set_bg_task_button(True, title)
 
         def runner() -> None:
             cancelled = False
             try:
-                if self._task_cancelled():
+                if cancel_ev.is_set():
                     cancelled = True
                     self._log(f"[{title}] 启动前已取消")
                 else:
                     fn()
-                    cancelled = self._task_cancelled()
+                    cancelled = cancel_ev.is_set()
             except Exception as exc:
-                if self._task_cancelled() or "cancel" in str(exc).lower():
+                if cancel_ev.is_set() or "cancel" in str(exc).lower():
                     cancelled = True
                     self._log(f"[{title}] 已强制停止: {exc}")
                 else:
@@ -1086,14 +1130,14 @@ class App(tk.Tk):
             finally:
                 if cancelled:
                     self._log(f"[{title}] 已由【停止任务】强制结束")
+                    try:
+                        cancel_ev.set()
+                    except Exception:
+                        pass
                 else:
                     self._log(f"[{title}] 结束")
                 self._busy = False
                 self._bg_title = ""
-                try:
-                    self._bg_cancel.clear()
-                except Exception:
-                    pass
                 self._set_bg_task_button(False)
                 try:
                     self.after(0, self.refresh_vms)
@@ -1176,6 +1220,15 @@ class App(tk.Tk):
             self._log(f"新建并启动结果: {result}")
             new_ids = result.get("new_ids") or []
             boot = result.get("boot") or {}
+            try:
+                ids_int = [int(i) for i in new_ids]
+                self.cfg["last_selected_vms"] = ids_int
+                from core.config_store import save_config
+                save_config(self._collect_cfg() if hasattr(self, "_collect_cfg") else self.cfg)
+                self._log(f"已选中新建VM: {ids_int}")
+            except Exception as exc:
+                self._log(f"更新 last_selected_vms 失败: {exc}")
+
             # 启动完成后立刻一字排列 + 强制序号名（不等待装包）
             if new_ids:
                 for idx in new_ids:
@@ -1208,19 +1261,55 @@ class App(tk.Tk):
             if self._task_cancelled():
                 self._log("装包阶段: 已强制停止，跳过 provision")
                 return
-            todo = [idx for idx in new_ids if boot.get(idx, True)]
-            skip = [idx for idx in new_ids if not boot.get(idx, True)]
-            for idx in skip:
-                self._log(f"VM={idx} 启动未完成，跳过装包")
+            # 启动失败的也进装包池：provision 内会再 wait boot，避免 10 台只剩 4~8 台在跑
+            booted = [idx for idx in new_ids if boot.get(idx, True)]
+            slow = [idx for idx in new_ids if not boot.get(idx, True)]
+            for idx in slow:
+                self._log(f"VM={idx} 启动未在限时内完成，仍进入装包线程二次等待")
+            todo = list(new_ids)
+            if len(todo) != len(new_ids):
+                self._log(f"装包列表异常 todo={todo} new_ids={new_ids}")
             prov_workers = max(1, min(int(workers), len(todo) or 1))
             self._log(
-                f"并行装包/provision: {todo} 线程={prov_workers} opts={install_opts} aurora={prefer_aurora}"
+                f"并行装包/provision: todo={todo} booted={booted} slow={slow} "
+                f"线程={prov_workers}/{workers} create_count目标并行 opts={install_opts} aurora={prefer_aurora}"
             )
+            if prov_workers < len(todo):
+                self._log(
+                    f"警告: 装包线程 {prov_workers} < 待装 {len(todo)}，"
+                    f"请把【新建启动线程】调到 >= 新建数量以实现同步安装"
+                )
 
-            def _prov(idx: int):
-                if self._task_cancelled():
+            # 捕获本轮任务取消令牌，避免新任务替换 self._bg_cancel 后旧装包线程复活
+            task_cancel_ev = getattr(self, "_bg_cancel", None) or threading.Event()
+            task_bg_gen = int(getattr(self, "_bg_gen", 0) or 0)
+
+            def _job_cancelled() -> bool:
+                try:
+                    if task_cancel_ev.is_set():
+                        return True
+                except Exception:
+                    pass
+                try:
+                    return int(getattr(self, "_bg_gen", 0) or 0) != task_bg_gen
+                except Exception:
+                    return False
+
+            def _prov(idx: int, order: int = 0):
+                if _job_cancelled():
                     return idx, {"cancelled": True}, None
                 try:
+                    # 轻微错峰：保持近乎同时，但避免 10 路同一毫秒打满 adb
+                    if order:
+                        end = time.time() + min(4.0, 0.45 * order)
+                        while time.time() < end:
+                            if _job_cancelled():
+                                return idx, {"cancelled": True}, None
+                            time.sleep(0.05)
+                    self._log(
+                        f"VM={idx} 装包线程启动 order={order+1}/{len(todo)} "
+                        f"workers={prov_workers}"
+                    )
                     out = self._provision_new_vm(
                         idx,
                         boot_timeout=boot_timeout,
@@ -1228,32 +1317,77 @@ class App(tk.Tk):
                         prefer_aurora=prefer_aurora,
                     )
                     return idx, out, None
-                except Exception as exc:
-                    return idx, None, exc
+                except BaseException as exc:
+                    # TaskCancelled 继承 BaseException；停止时不当成普通失败
+                    try:
+                        from core.root_setup import TaskCancelled
+                        if isinstance(exc, TaskCancelled) or _job_cancelled():
+                            return idx, {"cancelled": True, "status": "cancelled"}, None
+                    except Exception:
+                        if _job_cancelled():
+                            return idx, {"cancelled": True, "status": "cancelled"}, None
+                    if isinstance(exc, Exception):
+                        return idx, None, exc
+                    raise
 
             if todo and not self._task_cancelled():
-                with ThreadPoolExecutor(max_workers=prov_workers) as ex:
-                    futs = [ex.submit(_prov, i) for i in todo]
-                    for fut in as_completed(futs):
-                        try:
-                            idx, out, exc = fut.result()
-                        except Exception as exc2:
-                            self._log(f"装包 future 异常: {exc2}")
-                            continue
-                        if exc is not None:
-                            self._log(f"VM={idx} 新建装包异常: {exc}")
-                        else:
-                            self._log(f"VM={idx} 新建装包完成: {str(out)[:220]}")
-                        if self._task_cancelled():
-                            self._log("装包: 检测到停止任务，等待已提交任务自行退出...")
-                            # 取消尚未开始的 future（进行中的靠 RootSetup._cancelled）
-                            for f in futs:
+                from concurrent.futures import wait, FIRST_COMPLETED
+                ex = ThreadPoolExecutor(max_workers=prov_workers)
+                futs = []
+                try:
+                    futs = [ex.submit(_prov, i, n) for n, i in enumerate(todo)]
+                    pending = set(futs)
+                    # instant-stop-v2: 不再用 as_completed 死等；0.3s 轮询取消
+                    while pending:
+                        if _job_cancelled() or self._task_cancelled():
+                            self._log("装包: 检测到停止任务，立即取消线程池/打断 ADB...")
+                            try:
+                                from core.adb_client import AdbClient
+                                AdbClient.request_cancel_all()
+                                AdbClient.interrupt_all()
+                            except Exception:
+                                pass
+                            for f in list(pending):
                                 try:
                                     f.cancel()
                                 except Exception:
                                     pass
                             break
-            if new_ids:
+                        done, pending = wait(pending, timeout=0.3, return_when=FIRST_COMPLETED)
+                        if not done:
+                            continue
+                        for fut in done:
+                            try:
+                                idx, out, exc = fut.result(timeout=0)
+                            except Exception as exc2:
+                                self._log(f"装包 future 异常: {exc2}")
+                                continue
+                            if exc is not None:
+                                self._log(f"VM={idx} 新建装包异常: {exc}")
+                            else:
+                                st = ""
+                                try:
+                                    st = str((out or {}).get("status") or "")
+                                except Exception:
+                                    st = ""
+                                if st == "cancelled":
+                                    self._log(f"VM={idx} 新建装包已取消")
+                                else:
+                                    self._log(f"VM={idx} 新建装包完成: {str(out)[:220]}")
+                finally:
+                    try:
+                        # immediate-stop-v1/v2: 不要 wait=True 卡死在 adb install 上
+                        ex.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        try:
+                            ex.shutdown(wait=False)
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        self._log(f"装包线程池关闭警告: {exc}")
+            if new_ids and self._task_cancelled():
+                self._log("装包后收尾已跳过（任务已停止）")
+            if new_ids and not self._task_cancelled():
                 if self.var_sort.get():
                     try:
                         layout2 = self.mumu.layout_row_from_top_left(
@@ -1293,7 +1427,22 @@ class App(tk.Tk):
         """单台新建模拟器：装包 + Kitsune DirectInstall + Zygisk/Hide/SuList + ih8 + Venmo。"""
         from core.root_setup import RootSetup
 
-        if self._task_cancelled():
+        # zombie-cancel-v2: 捕获本任务 Event+代际；新任务/停止都不会让本线程复活
+        cancel_ev = getattr(self, "_bg_cancel", None) or threading.Event()
+        bg_gen = int(getattr(self, "_bg_gen", 0) or 0)
+
+        def _cancelled() -> bool:
+            try:
+                if cancel_ev.is_set():
+                    return True
+            except Exception:
+                pass
+            try:
+                return int(getattr(self, "_bg_gen", 0) or 0) != bg_gen
+            except Exception:
+                return False
+
+        if _cancelled():
             self._log(f"VM={vmindex} provision 已取消")
             return {"vmindex": str(vmindex), "status": "cancelled"}
         self._log(f"VM={vmindex} 开始新建装包 provision ...")
@@ -1301,20 +1450,24 @@ class App(tk.Tk):
             self.mumu.adb_connect(vmindex)
         except Exception as exc:
             self._log(f"VM={vmindex} adb_connect: {exc}")
-        if self._task_cancelled():
+        if _cancelled():
             return {"vmindex": str(vmindex), "status": "cancelled"}
         adb = self.mumu.adb_for(vmindex)
+        try:
+            adb.set_cancel_check(_cancelled)
+        except Exception:
+            pass
         try:
             adb.connect()
             adb.wait_device(timeout=min(90, boot_timeout))
         except Exception as exc:
             self._log(f"VM={vmindex} wait_device: {exc}")
-        if self._task_cancelled():
+        if _cancelled():
             return {"vmindex": str(vmindex), "status": "cancelled"}
         # RootSetup(mumu, adb) — 顺序不可反；APK/模块路径用内置 defaults
         rs = RootSetup(self.mumu, adb)
         try:
-            rs.set_cancel_check(self._task_cancelled)
+            rs.set_cancel_check(_cancelled)
         except Exception:
             pass
         out = rs.provision_new_vm(
@@ -1325,7 +1478,7 @@ class App(tk.Tk):
             prefer_aurora_venmo=prefer_aurora,
             restart_after_module=True,
         )
-        if self._task_cancelled():
+        if _cancelled():
             out = dict(out or {})
             out["status"] = "cancelled"
         self._log(f"VM={vmindex} provision 结果: {out}")
@@ -1343,7 +1496,7 @@ class App(tk.Tk):
         defaults = self.cfg.get("create_defaults", {})
 
         def job() -> None:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
             if self._task_cancelled():
                 self._log("启动选中: 已取消")
@@ -1359,14 +1512,40 @@ class App(tk.Tk):
                     defaults=defaults,
                     log=self._log,
                     ensure_settings=True,
+                    cancel_check=self._task_cancelled,
                 )
                 return idx, ok
 
-            with ThreadPoolExecutor(max_workers=min(workers, len(ids))) as ex:
+            ex = ThreadPoolExecutor(max_workers=min(workers, len(ids)))
+            try:
                 futs = [ex.submit(one, i) for i in ids]
-                for fut in as_completed(futs):
-                    idx, ok = fut.result()
-                    self._log(f"启动结果 VM={idx} android={ok}")
+                pending = set(futs)
+                while pending:
+                    if self._task_cancelled():
+                        self._log("启动选中: 检测到停止，立即结束等待")
+                        for f in list(pending):
+                            try:
+                                f.cancel()
+                            except Exception:
+                                pass
+                        break
+                    done, pending = wait(pending, timeout=0.3, return_when=FIRST_COMPLETED)
+                    if not done:
+                        continue
+                    for fut in done:
+                        try:
+                            idx, ok = fut.result(timeout=0)
+                            self._log(f"启动结果 VM={idx} android={ok}")
+                        except Exception as exc:
+                            self._log(f"启动 future 异常: {exc}")
+            finally:
+                try:
+                    ex.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    ex.shutdown(wait=False)
+            if self._task_cancelled():
+                self._log("启动选中: 已停止，跳过排列")
+                return
             if self.var_sort.get():
                 try:
                     self.mumu.layout_row_from_top_left(
@@ -1879,30 +2058,57 @@ class App(tk.Tk):
         except Exception as exc:
             self._log(f"发送停止信号失败: {exc}")
 
-        # 普通停止：长时间等待当前登录完成；未完成绝不关模拟器
-        join_timeout = float(self.cfg.get("stop_join_timeout_seconds", 1800) or 1800)
-        if join_timeout < 300:
-            join_timeout = 1800.0
+        # immediate-stop-v1: 第一次点击即强制停止（短 join），不再卡 1800s
+        join_timeout = float(self.cfg.get("stop_force_join_timeout_seconds", 8) or 8)
+        if join_timeout < 3:
+            join_timeout = 8.0
+        if join_timeout > 30:
+            join_timeout = 30.0
         shutdown_vms = bool(self.cfg.get("stop_shutdown_vms", True))
         self._log(
-            f"停止中: 等待当前登录任务完成后再关模拟器(最长 {join_timeout:.0f}s)；"
-            f"未完成不关机。{'完成后关闭' if shutdown_vms else '完成后不关闭'}模拟器。"
-            f"卡住再点【强制停止】才会打断并关机。"
+            f"停止中: 立即强制停止（最长等待 {join_timeout:.0f}s），"
+            f"{'完成后关闭' if shutdown_vms else '完成后不关闭'}模拟器。"
         )
+        try:
+            from core.adb_client import AdbClient
+            AdbClient.request_cancel_all()
+            killed = AdbClient.interrupt_all()
+            self._log(f"[停止登录] 已中断活动 ADB killed={killed}")
+        except Exception as exc:
+            self._log(f"停止时中断 ADB 失败: {exc}")
+
+        def _pulse_login_kill() -> None:
+            try:
+                from core.adb_client import AdbClient as _Adb
+            except Exception:
+                return
+            for _i in range(30):
+                try:
+                    if not getattr(self, "_stopping_ui", False):
+                        break
+                    _Adb.request_cancel_all()
+                    _Adb.interrupt_all()
+                except Exception:
+                    pass
+                time.sleep(0.3)
+        try:
+            threading.Thread(target=_pulse_login_kill, name="stop-login-pulse", daemon=True).start()
+        except Exception:
+            pass
 
         def job() -> None:
             try:
                 result = eng.stop_and_shutdown(
                     join_timeout=join_timeout,
                     shutdown_vms=shutdown_vms,
-                    force=False,
+                    force=True,
                 )
             except Exception as exc:
-                result = {"ok": False, "error": str(exc)}
-                self._log(f"优雅停止异常: {exc}")
+                result = {"ok": False, "error": str(exc), "force": True}
+                self._log(f"强制停止异常: {exc}")
             self.after(0, lambda: self._on_stop_done(result))
 
-        threading.Thread(target=job, name="stop-login", daemon=True).start()
+        threading.Thread(target=job, name="stop-login-force1", daemon=True).start()
 
     def _on_stop_done(self, result: dict | None = None) -> None:
         result = result or {}
