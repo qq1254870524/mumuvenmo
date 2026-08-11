@@ -1,0 +1,105 @@
+TARGET=E:\mumuvenmo
+RESULT=强制停止后中断当前 Venmo 登录调用栈；只有 workers=0 才报告停止完成；停止后的实时日志不再持续更新。
+NEXT=GUI 已使用修复源码重新启动并保持空闲，可直接开始下一批任务。
+
+CHANGED_BRANCH=force=True -> VenmoLogin.cancel_check/_sleep -> LoginCancelled(BaseException) -> AccountStore.release_without_result -> WorkerEngine workers=0 finalize -> App cleanup_pending poll
+CHANGED_FIELD=cancel_check, _force_stop_event, cleanup_pending, alive_left, joined, running, _stopping_ui, ui_log
+
+FOUR_PATHS:
+MODIFIED_FILE=E:\mumuvenmo\core\venmo_login.py
+DIFF_FILE=E:\mumuvenmo\docs\instant_stop_no_tail_fix_20260811\instant_stop_no_tail.patch
+VERIFICATION_FILE=E:\mumuvenmo\docs\instant_stop_no_tail_fix_20260811\VERIFICATION.txt
+ROLLBACK_FILE=E:\mumuvenmo\docs\instant_stop_no_tail_fix_20260811\ROLLBACK.sh
+SUPPORTING_MODIFIED_FILE_1=E:\mumuvenmo\core\worker_engine.py
+SUPPORTING_MODIFIED_FILE_2=E:\mumuvenmo\app_ui.py
+
+ORIGINAL_SHA256:
+app_ui.py=C2107B065ADF07D1835C7DA16DC238F0ABA6E35CCE9B4345BDE2A89EED885423
+core\venmo_login.py=7DEEAE5EA6BE3C2D03A7E8AF02811038ED746D701811C2211952074AF8B5971F
+core\worker_engine.py=3BB96C4F0D7B8BFB27F83D4A1E8E9EE0C9613A61B5572D6613A4AD7BB666D5B4
+
+MODIFIED_SHA256:
+app_ui.py=9A5C86C33BF1F3CD7B70BE9ACB5D0126382A17BA7B1084190009417D770C21E4
+core\venmo_login.py=93F364AE2B63BC9AD5A7A44104485C8A93D9F67D08B0DEFDA5CDE53FE8E4C355
+core\worker_engine.py=B423B0D35A0AA1243B7DEFDD287E144384512D0382E6C76E197991474E78080E
+instant_stop_no_tail.patch=E8EC6906032B204C045AEED7D0B7D9BF112D47EA99B216D932D283C7C3B40D4C
+ROLLBACK.sh=2CE86D3986CCE8C986B1BBB9B99F1C6807BD5186D434DED58D40DF2FA2459045
+
+BASELINE:
+COMMAND=python -B "E:\mumuvenmo\docs\instant_stop_no_tail_fix_20260811\VERIFY_SOURCE_BRANCH.py" --source-root "E:\mumuvenmo\docs\instant_stop_no_tail_fix_20260811\original" --mode baseline
+INPUT=原始 app_ui.py、core\venmo_login.py、core\worker_engine.py 保存副本；mode=baseline
+LITERAL_OUTPUT=
+cancel_check_param=False
+worker_log_records=2
+cancel_releases_account=False
+start_clears_adb_cancel=False
+BASELINE_EXIT=0
+EXIT_STATUS=0
+BASELINE_OBSERVED_LIVE=旧 GUI 已显示停止后，run_20260811.log 在 5 秒内仍增加 38350 bytes，且 PID 19160 的 worker 继续执行 ADB devices。
+
+MODIFIED:
+COMMAND=python -B "E:\mumuvenmo\docs\instant_stop_no_tail_fix_20260811\VERIFY_SOURCE_BRANCH.py" --source-root "E:\mumuvenmo" --mode modified
+INPUT=已部署源码 E:\mumuvenmo；mode=modified
+LITERAL_OUTPUT=
+cancel_check_param=True
+worker_log_records=1
+cancel_releases_account=True
+start_clears_adb_cancel=True
+MODIFIED_EXIT=0
+EXIT_STATUS=0
+
+MODIFIED_RUNTIME:
+COMMAND=python -B "E:\mumuvenmo\docs\instant_stop_no_tail_fix_20260811\VERIFY_RUNTIME.py"
+INPUT=30 秒可取消等待、模拟 Worker 强停、单条日志回调；不连接账号、不启动模拟器
+LITERAL_OUTPUT=
+cancel_check_param=True
+worker_log_records=1
+cancel_outcome=cancelled
+cancel_bypasses_exception=True
+cancel_thread_alive=False
+cancel_latency_lt_0_35=True
+engine_stop_joined=True
+engine_stop_alive_left=0
+engine_stop_running=False
+PRODUCTION_RUNTIME_EXIT=0
+EXIT_STATUS=0
+
+RUNTIME_SOURCE_VALIDATION:
+COMMAND=python -B -c "import ast,pathlib; root=pathlib.Path(r'E:\mumuvenmo'); files=list(root.glob('*.py'))+list((root/'core').glob('*.py')); [ast.parse(p.read_text(encoding='utf-8-sig'),filename=str(p)) for p in files]; print(f'RUNTIME_AST_OK={len(files)}')"
+INPUT=运行主目录与 core 目录的 15 个 Python 源文件
+LITERAL_OUTPUT=
+RUNTIME_AST_OK=15
+EXIT_STATUS=0
+
+ROLLBACK:
+COMMAND="C:\Program Files\Git\bin\bash.exe" "E:/mumuvenmo/docs/instant_stop_no_tail_fix_20260811/ROLLBACK.sh" "C:/Users/zhang/Desktop/codex_tmp/mumuvenmo_stop_tail_rollback_test_20260811_2231"
+INPUT=另一份测试树，预先放入三份修改后源码；目标不是 E:\mumuvenmo
+LITERAL_OUTPUT=
+ROLLBACK_AST_OK=3
+ROLLBACK_RESTORED=app_ui.py,core/venmo_login.py,core/worker_engine.py
+ROLLBACK_EXIT=0
+app_ui.py_RESTORED=True
+venmo_login.py_RESTORED=True
+worker_engine.py_RESTORED=True
+EXIT_STATUS=0
+RESTORED_BEHAVIOR_COMMAND=python -B "E:\mumuvenmo\docs\instant_stop_no_tail_fix_20260811\VERIFY_SOURCE_BRANCH.py" --source-root "C:\Users\zhang\Desktop\codex_tmp\mumuvenmo_stop_tail_rollback_test_20260811_2231" --mode baseline
+RESTORED_BEHAVIOR_LITERAL_OUTPUT=
+cancel_check_param=False
+worker_log_records=2
+cancel_releases_account=False
+start_clears_adb_cancel=False
+BASELINE_EXIT=0
+ROLLBACK_BEHAVIOR_EXIT=0
+RESTORED_STATUS=测试副本三文件 SHA256 与保存的原始文件逐一一致；测试副本已清理；E:\mumuvenmo 的 MODIFIED_FILE 仍保持修改后 SHA256。
+
+RESTART_AND_IDLE:
+COMMAND=Start-Process cmd.exe /c E:\mumuvenmo\start.cmd; wait 3s; measure run_20260811.log for 5s
+INPUT=修改后 GUI，空闲且不启动登录任务
+LITERAL_OUTPUT=
+APP_COUNT=1
+ProcessId=97716
+CommandLine=python  -B main.py
+IDLE_LOG_DELTA_5S=0
+GUI_START_EXIT=0
+EXIT_STATUS=0
+FINAL_STATUS=GUI 已重新启动；没有活动登录线程；停止后的旧日志已终止；修改后源码保持部署状态。

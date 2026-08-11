@@ -1,4 +1,3 @@
-# 2026-08-11 force-stop-no-tail-v1: 强停取消 Venmo 调用栈、退回当前账号、worker=0 后才报告完成；修复重复日志
 # 2026-08-11 progressive-proxy-gate-v1: Worker 并发启动前测代理；可用 IP 先继续，不通刷新后每 10 秒多次复测
 # 2026-07-31 immediate-stop-v1: force 停登录时打断 ADB，join 上限 8s
 # 2026-07-25 layout-tight-v1: 登录线程一字紧贴排列 auto_fit margin=0
@@ -60,7 +59,7 @@ from core.proxy_pool import (
     check_socks5_proxy_host,
 )
 from core.root_setup import RootSetup
-from core.venmo_login import LoginCancelled, VenmoLogin
+from core.venmo_login import VenmoLogin
 from paths import DATA_SETUP_DIR, DATA_STATE_DIR, ensure_under_root
 
 logger = logging.getLogger("mumuvenmo")
@@ -83,7 +82,7 @@ class WorkerEngine:
         self.store = store
         self.proxy_pool = proxy_pool
         self.config = config
-        self.ui_log = ui_log
+        self.ui_log = ui_log or (lambda m: None)
         self._stop = threading.Event()
         self._stopping = False
         self._threads: list[threading.Thread] = []
@@ -99,7 +98,6 @@ class WorkerEngine:
         self._vm_ops_lock = threading.Lock()
         # 强制停止接管优雅停止等待
         self._force_stop_event = threading.Event()
-        self._stop_reaper_started = False
         # 同步代理池刷新参数
         self._sync_proxy_config()
 
@@ -117,15 +115,11 @@ class WorkerEngine:
             pass
 
     def log(self, msg: str) -> None:
-        # app_ui._log 本身会写同一个 logger；旧实现先 logger.info 再回调，
-        # 导致文件和实时日志每行重复两次。
-        if self.ui_log is not None:
-            try:
-                self.ui_log(msg)
-                return
-            except Exception:
-                pass
         logger.info(msg)
+        try:
+            self.ui_log(msg)
+        except Exception:
+            pass
 
     def stop(self) -> None:
         """发送停止信号：不再领取新账号，当前登录任务会跑完。"""
@@ -146,38 +140,6 @@ class WorkerEngine:
     def current_logins(self) -> dict[str, str]:
         with self._lock:
             return dict(self._current_login)
-
-    def _finalize_stopped_state(self) -> bool:
-        """仅在所有 worker 真正退出后清理状态并允许下一轮启动。"""
-        if self.alive_workers() > 0:
-            return False
-        with self._lock:
-            self._current_login.clear()
-            self._threads = []
-            self.running = False
-            self._stopping = False
-            self._stop_reaper_started = False
-        self._force_stop_event.clear()
-        return True
-
-    def _start_stop_reaper(self) -> None:
-        """极端情况下后台等待残留 worker；退出前绝不把引擎标成已停止。"""
-        with self._lock:
-            if self._stop_reaper_started:
-                return
-            self._stop_reaper_started = True
-            threads = list(self._threads)
-
-        def _reap() -> None:
-            for thread in threads:
-                try:
-                    thread.join()
-                except Exception:
-                    pass
-            if self._finalize_stopped_state():
-                self.log("强制停止延迟收尾完成: workers=0，实时日志已停止")
-
-        threading.Thread(target=_reap, name="StopWorkerReaper", daemon=True).start()
 
     def stop_and_shutdown(
         self,
@@ -217,7 +179,7 @@ class WorkerEngine:
             except Exception as exc:
                 self.log(f"强制停止中断 ADB 失败: {exc}")
             join_timeout = min(float(join_timeout), 8.0)
-            self.log(f"强制停止: join_timeout 压缩为 {join_timeout:.0f}s，已请求取消登录/ADB；仅 workers=0 后报告完成")
+            self.log(f"强制停止: join_timeout 压缩为 {join_timeout:.0f}s，已请求取消 ADB，超时后仍可关模拟器")
         else:
             # 新一轮优雅停止：清除旧强制标记
             try:
@@ -283,9 +245,9 @@ class WorkerEngine:
         if alive_left:
             self.log(
                 f"警告: {alive_left} 个 worker 在超时后仍存活"
-                + ("；强制停止将继续关模拟器并等待 worker 真正退出" if force else "；普通停止不关模拟器，请再点【强制停止】或继续等待")
+                + ("；强制停止将继续关模拟器并结束状态" if force else "；普通停止不关模拟器，请再点【强制停止】或继续等待")
             )
-            result["ok"] = False
+            result["ok"] = False if not force else True
             result["forced_alive"] = alive_left
         else:
             self.log("所有 worker 已结束当前任务")
@@ -322,28 +284,15 @@ class WorkerEngine:
         elif not shutdown_vms:
             self.log("配置为停止后不关闭模拟器")
 
-        # 关机后再给已取消的登录栈短暂收尾时间。旧版此处无条件清空
-        # self._threads，造成 UI 显示“已结束”但孤儿 worker 继续刷日志。
-        if force:
-            post_deadline = time.time() + 5.0
-            while time.time() < post_deadline:
-                alive = [t for t in self._threads if t.is_alive()]
-                if not alive:
-                    break
-                for t in alive:
-                    t.join(timeout=0.2)
-        alive_left = self.alive_workers()
-        result["alive_left"] = alive_left
-        result["joined"] = alive_left == 0
-        if alive_left:
-            result["ok"] = False
-            result["cleanup_pending"] = True
-            self.log(f"强制停止尚在收尾: alive_left={alive_left}，保持取消状态，不报告完成")
-            self._start_stop_reaper()
-            return result
-
-        self._finalize_stopped_state()
-        result["ok"] = not bool(result["shutdown_errors"])
+        with self._lock:
+            self._current_login.clear()
+            self._threads = []
+            self.running = False
+            self._stopping = False
+        try:
+            self._force_stop_event.clear()
+        except Exception:
+            pass
         self.log(
             f"停止结束: joined={result['joined']} shutdown={result['shutdown']} "
             f"skipped={result.get('shutdown_skipped')} errors={result['shutdown_errors']}"
@@ -355,8 +304,6 @@ class WorkerEngine:
         if self.running:
             self.log("已在运行中")
             return
-        # 上一轮强停会置全局 ADB cancel；新任务必须显式清掉。
-        AdbClient.clear_cancel_all()
         self._stop.clear()
         self._stopping = False
         with self._lock:
@@ -1522,7 +1469,6 @@ class WorkerEngine:
             package=self.config.get("venmo_package", "com.venmo"),
             login_timeout=int(self.config.get("login_timeout_seconds", 90)),
             log=lambda m: self.log(f"{worker_id} {m}"),
-            cancel_check=lambda: self._force_stop_event.is_set(),
         )
         max_no_net_retry = int(self.config.get("no_network_retry_after_refresh", 1))
         consecutive_limit = int(self.config.get("consecutive_risk_nonet_limit", 5) or 5)
@@ -1732,15 +1678,6 @@ class WorkerEngine:
                     )
                     # rebind 已迁移代理，旧 key 不再 release
                     return self._worker_loop(new_idx, worker_id)
-            except LoginCancelled:
-                self.store.release_without_result(acc)
-                consecutive_bad = 0
-                with self._lock:
-                    self._current_login.pop(worker_id, None)
-                self.log(
-                    f"{worker_id} 当前登录已强制取消 line={acc.line_no}，账号已退回待处理"
-                )
-                break
             except Exception as exc:
                 self.store.finish(acc, LoginResult.ERROR, message=str(exc)[:200])
                 consecutive_bad = 0
@@ -1749,21 +1686,16 @@ class WorkerEngine:
                 self.log(f"{worker_id} 异常: {exc}")
             finally:
                 # 每账号结束后释放 UI，避免人工一点就卡白
-                # 强停时全局 ADB 已取消，继续逐条执行清理命令只会制造大量
-                # "ADB ..." 尾日志；模拟器关机会完成资源回收。
-                if not self._force_stop_event.is_set():
-                    try:
-                        adb.release_ui_control(home=False)
-                    except Exception:
-                        pass
-            if self._stop.wait(1.0):
-                break
+                try:
+                    adb.release_ui_control(home=False)
+                except Exception:
+                    pass
+            time.sleep(1.0)
 
-        if not self._force_stop_event.is_set():
-            try:
-                adb.release_ui_control(home=True)
-            except Exception:
-                pass
+        try:
+            adb.release_ui_control(home=True)
+        except Exception:
+            pass
         with self._lock:
             self._current_login.pop(worker_id, None)
         self.proxy_pool.release(f"vm-{vmindex}")

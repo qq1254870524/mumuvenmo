@@ -1,4 +1,3 @@
-# 2026-08-11 force-stop-cancel-v1: 登录全链路支持取消回调；所有等待可在 0.1 秒内中断，禁止停止后继续刷实时日志
 # - welcome-bounce-v1: 提交后回欢迎页快速恢复/失败，禁止验证候选后再 resubmit
 # -*- coding: utf-8 -*-
 """Venmo 登录：清数据 -> 欢迎页点 Log in -> 输账密 -> 识别红框结果。
@@ -60,10 +59,6 @@ class LoginOutcome:
     ui_snippet: str = ""
 
 
-class LoginCancelled(BaseException):
-    """强停控制流；不被登录流程中的 ``except Exception`` 误吞。"""
-
-
 # success-candidate-timeout-v1: 见验证页不因 dump 卡死 timeout 重登
 class VenmoLogin:
     def __init__(
@@ -72,41 +67,16 @@ class VenmoLogin:
         package: str = "com.venmo",
         login_timeout: int = 90,
         log: OptionalLog = None,
-        cancel_check: Optional[Callable[[], bool]] = None,
     ):
         self.adb = adb
         self.package = package
         self.login_timeout = login_timeout
         self.log = log or (lambda m: logger.info(m))
-        self.cancel_check = cancel_check
         # 提交过程中短暂弹出的红框结果（风控/错密/无网）必须锁定，禁止反复重提
         self._early_result: LoginResult | None = None
         self._early_message: str = ""
 
-    def _cancelled(self) -> bool:
-        try:
-            return bool(self.cancel_check and self.cancel_check())
-        except Exception:
-            return False
-
-    def _check_cancelled(self) -> None:
-        if self._cancelled():
-            raise LoginCancelled("login_cancelled")
-
-    def _sleep(self, seconds: float) -> None:
-        """可中断等待；强制停止后最迟 0.1 秒抛出 LoginCancelled。"""
-        deadline = time.monotonic() + max(0.0, float(seconds))
-        while True:
-            self._check_cancelled()
-            left = deadline - time.monotonic()
-            if left <= 0:
-                break
-            time.sleep(min(0.1, left))
-        self._check_cancelled()
-
     def _log(self, msg: str) -> None:
-        # 取消后连日志也立即截断，避免模拟器已关闭但旧登录栈仍持续刷新 GUI。
-        self._check_cancelled()
         try:
             self.log(str(msg).encode("utf-8", "replace").decode("utf-8"))
         except Exception:
@@ -148,7 +118,7 @@ class VenmoLogin:
             self.adb.shell("input", "keyevent", "3", timeout=8)  # HOME once
         except Exception as e:
             self._log(f"home key: {e}")
-        self._sleep(0.2)
+        time.sleep(0.2)
 
 
     def _release_ui(self) -> None:
@@ -197,7 +167,6 @@ class VenmoLogin:
         return "email, username" in low and "password" in low
 
     def clear_and_start(self) -> None:
-        self._check_cancelled()
         try:
             lp = self.adb.lock_portrait()
             self._log(
@@ -214,7 +183,7 @@ class VenmoLogin:
             self._log(f"force_stop venmo: {e}")
         out = self.adb.pm_clear(self.package)
         self._log(f"clear -> {(out or chr(32)).strip()[:120]}")
-        self._sleep(1.0)
+        time.sleep(1.0)
         self._log("start app")
         # 亮屏，避免 null root / 空 dump
         try:
@@ -224,8 +193,7 @@ class VenmoLogin:
         out2 = self.adb.start_app(self.package)
         self._log(f"start -> {(out2 or chr(32)).replace(chr(10), chr(32))[:160]}")
         for i in range(10):
-            self._check_cancelled()
-            self._sleep(1.8)
+            time.sleep(1.8)
             # 空 dump / 焦点丢失：不 HOME，直接重拉 Venmo
             try:
                 focus = self.adb.shell("dumpsys", "window", timeout=15) or ""
@@ -237,7 +205,7 @@ class VenmoLogin:
                     self.adb.start_app(self.package)
                 except Exception as e:
                     self._log(f"restart: {e}")
-                self._sleep(1.2)
+                time.sleep(1.2)
             try:
                 ui = self.adb.ui_full_text() or ""
             except Exception:
@@ -272,7 +240,7 @@ class VenmoLogin:
                     self.adb.shell("input", "keyevent", "3", timeout=10)
                 except Exception:
                     pass
-                self._sleep(0.4)
+                time.sleep(0.4)
                 try:
                     out2 = self.adb.start_app(self.package)
                     self._log(f"restart venmo -> {(out2 or chr(32)).replace(chr(10), chr(32))[:120]}")
@@ -289,7 +257,7 @@ class VenmoLogin:
                     self.adb.start_app(self.package)
                 except Exception:
                     pass
-        self._sleep(1.2)
+        time.sleep(1.2)
 
 
     def _ime_shown(self) -> bool:
@@ -308,7 +276,7 @@ class VenmoLogin:
             self.adb.shell("input", "keyevent", "111", timeout=5)  # KEYCODE_ESCAPE
         except Exception as e:
             self._log(f"esc dismiss ime: {e}")
-        self._sleep(0.2)
+        time.sleep(0.2)
 
     def _hide_keyboard(self) -> None:
         """兼容旧调用名。"""
@@ -430,7 +398,7 @@ class VenmoLogin:
                     self.adb.shell("input", "keyevent", "4", timeout=5)
                 except Exception:
                     pass
-            self._sleep(1.0)
+            time.sleep(1.0)
 
         # 0) 欢迎页则先进入表单
         try:
@@ -444,13 +412,13 @@ class VenmoLogin:
             except Exception:
                 xml_w = ""
             self._tap_welcome_login(xml_w)
-            self._sleep(2.0)
+            time.sleep(2.0)
 
         # 1) 必须先收键盘，否则 Log in 在键盘后面
         for _ in range(2):
             if self._ime_shown():
                 self._dismiss_ime_keep_form()
-                self._sleep(0.35)
+                time.sleep(0.35)
             else:
                 break
         # 额外 BACK 一次仅用于收键盘；若已在表单且无键盘则不动
@@ -459,7 +427,7 @@ class VenmoLogin:
                 self.adb.input_keyevent(4)
             except Exception:
                 pass
-            self._sleep(0.4)
+            time.sleep(0.4)
 
         _recover_forgot()
 
@@ -509,7 +477,7 @@ class VenmoLogin:
                 return False
             self._log(f"{reason}: {tag} nextButton/LogIn bounds={btn} center=({cx},{cy}) single-tap")
             self.adb.tap(cx, cy)
-            self._sleep(0.9)
+            time.sleep(0.9)
             return True
 
         # 2) 单次点 nextButton，然后优先等待红框/加载，禁止立刻再点密码（会滚到 Forgot password）
@@ -517,7 +485,7 @@ class VenmoLogin:
             clicked = True
             # 提交后轮询结果：有红框/验证/加载就立刻停，绝不再 focus 密码框
             for wait_i in range(6):
-                self._sleep(0.45 if wait_i == 0 else 0.55)
+                time.sleep(0.45 if wait_i == 0 else 0.55)
                 if _left_form_or_result():
                     return True
                 try:
@@ -534,7 +502,7 @@ class VenmoLogin:
                     self._log(f"{reason}: submitting/loading after Log in, wait result (no password tap)")
                     # 继续等结果，不进密码 ENTER
                     for _ in range(20):
-                        self._sleep(0.8)
+                        time.sleep(0.8)
                         if _left_form_or_result():
                             return True
                         try:
@@ -580,7 +548,7 @@ class VenmoLogin:
             # 优先再点一次底部 Log in，而不是点密码框（点密码框容易滚到 Forgot）
             if _tap_next_button_once(xml2, "retry-before-enter"):
                 clicked = True
-                self._sleep(1.0)
+                time.sleep(1.0)
                 if _left_form_or_result():
                     return True
             else:
@@ -593,7 +561,7 @@ class VenmoLogin:
                         self._log(f"{reason}: ENTER once without re-focus password (avoid Forgot scroll)")
                         self.adb.input_keyevent(66)
                         clicked = True
-                        self._sleep(1.2)
+                        time.sleep(1.2)
                         if _left_form_or_result():
                             return True
                         _recover_forgot()
@@ -608,7 +576,7 @@ class VenmoLogin:
         # 4) 再收一次键盘后重点一次
         if self._ime_shown():
             self._dismiss_ime_keep_form()
-            self._sleep(0.3)
+            time.sleep(0.3)
         try:
             xml3 = self.adb.uiautomator_dump(force=True) or ""
         except Exception:
@@ -655,13 +623,13 @@ class VenmoLogin:
                 last = self.adb.ui_full_text()
             except Exception as e:
                 self._log(f"ui wait fail: {e}")
-                self._sleep(1.5)
+                time.sleep(1.5)
                 continue
             low = last.lower()
             for n in needles:
                 if n.lower() in low:
                     return last
-            self._sleep(1.0)
+            time.sleep(1.0)
         return last
 
     def _tap_welcome_login(self, xml: str) -> bool:
@@ -693,7 +661,7 @@ class VenmoLogin:
                         return
                     self.adb.tap_bounds(b)
                     self._log(f"dismiss {key}")
-                    self._sleep(0.45)
+                    time.sleep(0.45)
                     xml_d = self.adb.uiautomator_dump()
         except Exception:
             pass
@@ -711,7 +679,7 @@ class VenmoLogin:
             self._force_stop_blockers()
             try:
                 self.adb.start_app(self.package)
-                self._sleep(3.0)
+                time.sleep(3.0)
             except Exception as e:
                 self._log(f"magisk recover: {e}")
             ui = self._wait_any_text(
@@ -728,10 +696,10 @@ class VenmoLogin:
                 self.adb.shell("input", "keyevent", "3", timeout=10)
             except Exception:
                 pass
-            self._sleep(0.4)
+            time.sleep(0.4)
             try:
                 self.adb.start_app(self.package)
-                self._sleep(3.0)
+                time.sleep(3.0)
             except Exception as e:
                 self._log(f"recover: {e}")
             ui = self._wait_any_text(
@@ -754,7 +722,7 @@ class VenmoLogin:
             if self._on_credential_form(xml):
                 return True
             self._log("welcome Log in control not found")
-        self._sleep(2.2)
+        time.sleep(2.2)
         self._dismiss_system_dialogs()
 
         deadline = time.time() + 18.0
@@ -774,7 +742,7 @@ class VenmoLogin:
                     self.adb.start_app(self.package)
                 except Exception as e:
                     self._log(f"recover start: {e}")
-                self._sleep(2.5)
+                time.sleep(2.5)
                 try:
                     xml_r = self.adb.uiautomator_dump() or ""
                 except Exception:
@@ -792,7 +760,7 @@ class VenmoLogin:
                             self.adb.tap(w // 2, int(h * 0.62))
                     except Exception as e:
                         self._log(f"welcome fallback: {e}")
-                self._sleep(2.0)
+                time.sleep(2.0)
                 continue
             xml2 = self.adb.uiautomator_dump() or ""
             if self._on_credential_form(xml2):
@@ -805,8 +773,8 @@ class VenmoLogin:
             if ("pay your people" in low or "pay for everything" in low) and "log in" in low:
                 self._log("still on welcome, re-tap Log in")
                 self._tap_welcome_login(xml2)
-                self._sleep(1.5)
-            self._sleep(1.0)
+                time.sleep(1.5)
+            time.sleep(1.0)
 
         ui2 = ""
         try:
@@ -827,12 +795,12 @@ class VenmoLogin:
                 self.adb.force_stop(self.package)
             except Exception:
                 pass
-            self._sleep(0.6)
+            time.sleep(0.6)
             try:
                 self.adb.start_app(self.package)
             except Exception as e:
                 self._log(f"restart after form miss: {e}")
-            self._sleep(2.5)
+            time.sleep(2.5)
         self._save_debug("no_login_form")
         return False
 
@@ -853,10 +821,10 @@ class VenmoLogin:
 
         self._log("fill email")
         self.adb.tap_bounds(email_b)
-        self._sleep(0.25)
+        time.sleep(0.25)
         self.adb.clear_field(50)
         self.adb.input_text_safe(account)
-        self._sleep(0.4)
+        time.sleep(0.4)
 
         # 更新 2026-07-24: 密码框可能在输入邮箱后短暂不可见，多策略+重试
         pw_b = None
@@ -887,7 +855,7 @@ class VenmoLogin:
                 self.adb.tap_text("Password")
             except Exception:
                 pass
-            self._sleep(0.7)
+            time.sleep(0.7)
         if not pw_b:
             self._log("password field not found")
             self._save_debug("no_password_field")
@@ -895,19 +863,19 @@ class VenmoLogin:
 
         self._log("fill password")
         self.adb.tap_bounds(pw_b)
-        self._sleep(0.25)
+        time.sleep(0.25)
         self.adb.clear_field(30)
         self.adb.input_text_safe(password)
-        self._sleep(0.35)
+        time.sleep(0.35)
         # 填完密码立刻收键盘，避免页面被顶到 Forgot password 区域，并露出 Log in
         self._dismiss_ime_keep_form()
-        self._sleep(0.35)
+        time.sleep(0.35)
 
         # 提交：收键盘后单次点 Log in（禁止 swipe）
         self._early_result = None
         self._early_message = ""
         self._tap_login_submit(reason="first_submit")
-        self._sleep(1.0)
+        time.sleep(1.0)
         # 提交过程中已锁定红框结果（风控/错密/无网）→ 禁止二次提交
         if self._early_result is not None and self._early_result != LoginResult.PENDING:
             self._log(
@@ -946,7 +914,7 @@ class VenmoLogin:
                 self.adb.input_keyevent(4)
             except Exception:
                 pass
-            self._sleep(0.8)
+            time.sleep(0.8)
             self._tap_login_submit(reason="after_forgot_recover")
         elif self._still_on_login_form(ui_chk, xml_chk):
             # 仅当从未见过红框时才二次提交一次（网络慢）
@@ -965,7 +933,7 @@ class VenmoLogin:
                 low0 = (ui_chk or "").lower()
                 _loading = ("this may take a few seconds" in low0) or ("may take a few seconds" in low0)
             if not _loading:
-                self._sleep(2.0)
+                time.sleep(2.0)
                 try:
                     xml2 = self.adb.uiautomator_dump(force=True) or xml_chk
                 except Exception:
@@ -1155,7 +1123,6 @@ class VenmoLogin:
 
 
     def attempt_login(self, account: str, password: str) -> LoginOutcome:
-        self._check_cancelled()
         self._log("登录尝试 account=%s" % account)
         self._saw_success_candidate = False
         self._success_candidate_phone = ""
@@ -1236,7 +1203,6 @@ class VenmoLogin:
                     ui_snippet=last_ui[:800],
                 )
         while time.time() < deadline:
-            self._check_cancelled()
             # 红框已锁：零等待返回，避免界面停在表单上再被点到 Forgot password
             if self._early_result in (
                 LoginResult.WRONG_PASSWORD,
@@ -1271,7 +1237,7 @@ class VenmoLogin:
                     wrong_account=account if result == LoginResult.WRONG_PASSWORD else "",
                     ui_snippet=last_ui[:800],
                 )
-            self._sleep(2.0 if getattr(self, "_saw_success_candidate", False) else 3.5)
+            time.sleep(2.0 if getattr(self, "_saw_success_candidate", False) else 3.5)
             try:
                 last_ui = self.adb.ui_full_text()
             except Exception as exc:
@@ -1286,7 +1252,7 @@ class VenmoLogin:
                     self.adb.start_app(self.package)
                 except Exception:
                     pass
-                self._sleep(2.0)
+                time.sleep(2.0)
                 continue
             if self._is_launcher_ui(last_ui):
                 self._log("poll: launcher front, re-start Venmo only")
@@ -1294,7 +1260,7 @@ class VenmoLogin:
                     self.adb.start_app(self.package)
                 except Exception:
                     pass
-                self._sleep(2.0)
+                time.sleep(2.0)
                 continue
 
             # 强制 dump 后重新取全文，尽量拿到完整掩码节点
@@ -1368,7 +1334,7 @@ class VenmoLogin:
                 # 验证页若掩码仍是短星号，多等一轮拿完整节点（最多额外 2 次由外循环承担）
                 if phone and re.fullmatch(r"\*+\d{1,4}", phone) and (deadline - time.time()) > 8:
                     self._log("verification page short mask=%r, wait fuller text" % (phone,))
-                    self._sleep(2.0)
+                    time.sleep(2.0)
                     continue
                 self._log("verification/masked page detected phone=%r" % (phone,))
                 self._save_debug("verification")
@@ -1409,7 +1375,7 @@ class VenmoLogin:
                     except Exception:
                         xml_w = ""
                     self._tap_welcome_login(xml_w)
-                    self._sleep(2.0)
+                    time.sleep(2.0)
                     continue
                 if self._welcome_bounce_count >= 2:
                     self._save_debug("welcome_bounce")
@@ -1424,7 +1390,7 @@ class VenmoLogin:
                 except Exception:
                     xml_w = ""
                 self._tap_welcome_login(xml_w)
-                self._sleep(1.5)
+                time.sleep(1.5)
                 continue
 
             # 已锁定红框结果 或 验证页 不再重提
@@ -1486,7 +1452,6 @@ class VenmoLogin:
         max_timeout_rounds = 8
         last = None
         for round_i in range(1, max_timeout_rounds + 1):
-            self._check_cancelled()
             self._log("login_with_fallback round=%s/%s a1=%s" % (round_i, max_timeout_rounds, account1))
             first = self.attempt_login(account1, password)
             last = first
@@ -1513,7 +1478,6 @@ class VenmoLogin:
         if last.result == LoginResult.WRONG_PASSWORD and account2:
             self._log("账号1密码错误，改用账号2: %s" % account2)
             for round_i in range(1, max_timeout_rounds + 1):
-                self._check_cancelled()
                 second = self.attempt_login(account2, password)
                 last = second
                 if second.result in (LoginResult.SUCCESS, LoginResult.RISK_CONTROL):

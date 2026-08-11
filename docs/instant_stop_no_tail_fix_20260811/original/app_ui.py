@@ -1,4 +1,3 @@
-# 2026-08-11 force-stop-no-tail-v1: Worker 真正退出前保持“停止收尾中”，禁止提前显示停止完成；收尾线程归零后再恢复空闲
 # 2026-08-11 socks5-gui-pool-v3: 代理在线检查改为各 Worker 并发门禁；可用 IP 线程先启动，不通则刷新后每 10 秒多次复测
 # 2026-07-31 zombie-cancel-v2: Event代际 + provision捕获cancel，旧线程不因clear复活
 # 2026-07-31 instant-stop-v2: 停止任务秒级生效(wait轮询+脉冲杀adb+跳过收尾)
@@ -2350,23 +2349,6 @@ class App(tk.Tk):
             )
             self.after(1000, self._poll_engine_state)
             return
-        # 强停后仍有 Worker 存活时绝不能提前显示“停止完成”。引擎的
-        # stop-reaper 会保留取消信号并等待真实退出；UI 同步等到 workers=0。
-        alive_left = int(result.get("alive_left") or 0)
-        if result.get("cleanup_pending") or alive_left > 0 or not result.get("joined", False):
-            self._stopping_ui = True
-            self._set_run_buttons(running=True, stopping=True)
-            try:
-                if getattr(self, "btn_stop", None) is not None:
-                    self.btn_stop.configure(state=tk.DISABLED, bg="#e65100", text="■ 停止收尾中")
-            except Exception:
-                pass
-            self._log(
-                f"强制停止收尾中: alive_left={alive_left}。"
-                "仍存活的登录线程退出前不会显示停止完成。"
-            )
-            self.after(300, self._poll_engine_state)
-            return
         self._stopping_ui = False
         self._set_run_buttons(running=False, stopping=False)
         if result.get("ok"):
@@ -2390,24 +2372,8 @@ class App(tk.Tk):
         """登录运行期间轮询引擎状态；全部结束后恢复按钮。"""
         eng = self.engine
         if self._stopping_ui:
-            alive = eng.alive_workers() if eng else 0
-            if alive > 0:
-                self.after(300, self._poll_engine_state)
-                return
-            # 所有 Worker 真正退出后才切回空闲并恢复全局 ADB 取消状态。
-            try:
-                finalize = getattr(eng, "_finalize_stopped_state", None) if eng else None
-                if callable(finalize):
-                    finalize()
-            except Exception as exc:
-                self._log(f"停止收尾状态同步警告: {exc}")
-            self._stopping_ui = False
-            self._set_run_buttons(running=False, stopping=False)
-            self._log("强制停止完成: workers=0，实时日志已停止")
-            try:
-                self.refresh_vms()
-            except Exception:
-                pass
+            # 停止流程由 _on_stop_done 恢复按钮
+            self.after(800, self._poll_engine_state)
             return
         if not eng:
             self._set_run_buttons(running=False, stopping=False)

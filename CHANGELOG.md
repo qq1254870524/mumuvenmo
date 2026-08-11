@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-11 — 强停后实时日志仍更新修复
+
+- `VenmoLogin` 的长等待与轮询改为 0.1 秒粒度可取消等待，强停后立即抛出 `LoginCancelled`。
+- 强停取消的账号退回 `pending`，不再被误记为登录错误。
+- `WorkerEngine` 只在全部 Worker 真正退出后清理运行状态和显示停止完成；极端残留由收尾线程等待。
+- 强停分支跳过已取消的 ADB UI 清理命令，消除模拟器关闭后的 ADB 尾日志。
+- 修复 `WorkerEngine.log` 与 `App._log` 重复落盘，同一事件由两行恢复为一行。
+- 新任务启动时清理上一轮全局 ADB 取消标志。
+
 ## 2026-08-11 — SOCKS5 GUI + progressive workers + compact row
 
 - SOCKS5 与刷新链接使用单行 `proxy|refresh_url`，GUI 支持动态增删。

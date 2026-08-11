@@ -1,0 +1,744 @@
+--- a/app_ui.py
++++ b/app_ui.py
+@@ -1,3 +1,4 @@
++# 2026-08-11 force-stop-no-tail-v1: Worker 真正退出前保持“停止收尾中”，禁止提前显示停止完成；收尾线程归零后再恢复空闲
+ # 2026-08-11 socks5-gui-pool-v3: 代理在线检查改为各 Worker 并发门禁；可用 IP 线程先启动，不通则刷新后每 10 秒多次复测
+ # 2026-07-31 zombie-cancel-v2: Event代际 + provision捕获cancel，旧线程不因clear复活
+ # 2026-07-31 instant-stop-v2: 停止任务秒级生效(wait轮询+脉冲杀adb+跳过收尾)
+@@ -2349,6 +2350,23 @@
+             )
+             self.after(1000, self._poll_engine_state)
+             return
++        # 强停后仍有 Worker 存活时绝不能提前显示“停止完成”。引擎的
++        # stop-reaper 会保留取消信号并等待真实退出；UI 同步等到 workers=0。
++        alive_left = int(result.get("alive_left") or 0)
++        if result.get("cleanup_pending") or alive_left > 0 or not result.get("joined", False):
++            self._stopping_ui = True
++            self._set_run_buttons(running=True, stopping=True)
++            try:
++                if getattr(self, "btn_stop", None) is not None:
++                    self.btn_stop.configure(state=tk.DISABLED, bg="#e65100", text="■ 停止收尾中")
++            except Exception:
++                pass
++            self._log(
++                f"强制停止收尾中: alive_left={alive_left}。"
++                "仍存活的登录线程退出前不会显示停止完成。"
++            )
++            self.after(300, self._poll_engine_state)
++            return
+         self._stopping_ui = False
+         self._set_run_buttons(running=False, stopping=False)
+         if result.get("ok"):
+@@ -2372,8 +2390,24 @@
+         """登录运行期间轮询引擎状态；全部结束后恢复按钮。"""
+         eng = self.engine
+         if self._stopping_ui:
+-            # 停止流程由 _on_stop_done 恢复按钮
+-            self.after(800, self._poll_engine_state)
++            alive = eng.alive_workers() if eng else 0
++            if alive > 0:
++                self.after(300, self._poll_engine_state)
++                return
++            # 所有 Worker 真正退出后才切回空闲并恢复全局 ADB 取消状态。
++            try:
++                finalize = getattr(eng, "_finalize_stopped_state", None) if eng else None
++                if callable(finalize):
++                    finalize()
++            except Exception as exc:
++                self._log(f"停止收尾状态同步警告: {exc}")
++            self._stopping_ui = False
++            self._set_run_buttons(running=False, stopping=False)
++            self._log("强制停止完成: workers=0，实时日志已停止")
++            try:
++                self.refresh_vms()
++            except Exception:
++                pass
+             return
+         if not eng:
+             self._set_run_buttons(running=False, stopping=False)
+--- a/core/venmo_login.py
++++ b/core/venmo_login.py
+@@ -1,3 +1,4 @@
++# 2026-08-11 force-stop-cancel-v1: 登录全链路支持取消回调；所有等待可在 0.1 秒内中断，禁止停止后继续刷实时日志
+ # - welcome-bounce-v1: 提交后回欢迎页快速恢复/失败，禁止验证候选后再 resubmit
+ # -*- coding: utf-8 -*-
+ """Venmo 登录：清数据 -> 欢迎页点 Log in -> 输账密 -> 识别红框结果。
+@@ -59,6 +60,10 @@
+     ui_snippet: str = ""
+ 
+ 
++class LoginCancelled(BaseException):
++    """强停控制流；不被登录流程中的 ``except Exception`` 误吞。"""
++
++
+ # success-candidate-timeout-v1: 见验证页不因 dump 卡死 timeout 重登
+ class VenmoLogin:
+     def __init__(
+@@ -67,16 +72,41 @@
+         package: str = "com.venmo",
+         login_timeout: int = 90,
+         log: OptionalLog = None,
++        cancel_check: Optional[Callable[[], bool]] = None,
+     ):
+         self.adb = adb
+         self.package = package
+         self.login_timeout = login_timeout
+         self.log = log or (lambda m: logger.info(m))
++        self.cancel_check = cancel_check
+         # 提交过程中短暂弹出的红框结果（风控/错密/无网）必须锁定，禁止反复重提
+         self._early_result: LoginResult | None = None
+         self._early_message: str = ""
+ 
++    def _cancelled(self) -> bool:
++        try:
++            return bool(self.cancel_check and self.cancel_check())
++        except Exception:
++            return False
++
++    def _check_cancelled(self) -> None:
++        if self._cancelled():
++            raise LoginCancelled("login_cancelled")
++
++    def _sleep(self, seconds: float) -> None:
++        """可中断等待；强制停止后最迟 0.1 秒抛出 LoginCancelled。"""
++        deadline = time.monotonic() + max(0.0, float(seconds))
++        while True:
++            self._check_cancelled()
++            left = deadline - time.monotonic()
++            if left <= 0:
++                break
++            time.sleep(min(0.1, left))
++        self._check_cancelled()
++
+     def _log(self, msg: str) -> None:
++        # 取消后连日志也立即截断，避免模拟器已关闭但旧登录栈仍持续刷新 GUI。
++        self._check_cancelled()
+         try:
+             self.log(str(msg).encode("utf-8", "replace").decode("utf-8"))
+         except Exception:
+@@ -118,7 +148,7 @@
+             self.adb.shell("input", "keyevent", "3", timeout=8)  # HOME once
+         except Exception as e:
+             self._log(f"home key: {e}")
+-        time.sleep(0.2)
++        self._sleep(0.2)
+ 
+ 
+     def _release_ui(self) -> None:
+@@ -167,6 +197,7 @@
+         return "email, username" in low and "password" in low
+ 
+     def clear_and_start(self) -> None:
++        self._check_cancelled()
+         try:
+             lp = self.adb.lock_portrait()
+             self._log(
+@@ -183,7 +214,7 @@
+             self._log(f"force_stop venmo: {e}")
+         out = self.adb.pm_clear(self.package)
+         self._log(f"clear -> {(out or chr(32)).strip()[:120]}")
+-        time.sleep(1.0)
++        self._sleep(1.0)
+         self._log("start app")
+         # 亮屏，避免 null root / 空 dump
+         try:
+@@ -193,7 +224,8 @@
+         out2 = self.adb.start_app(self.package)
+         self._log(f"start -> {(out2 or chr(32)).replace(chr(10), chr(32))[:160]}")
+         for i in range(10):
+-            time.sleep(1.8)
++            self._check_cancelled()
++            self._sleep(1.8)
+             # 空 dump / 焦点丢失：不 HOME，直接重拉 Venmo
+             try:
+                 focus = self.adb.shell("dumpsys", "window", timeout=15) or ""
+@@ -205,7 +237,7 @@
+                     self.adb.start_app(self.package)
+                 except Exception as e:
+                     self._log(f"restart: {e}")
+-                time.sleep(1.2)
++                self._sleep(1.2)
+             try:
+                 ui = self.adb.ui_full_text() or ""
+             except Exception:
+@@ -240,7 +272,7 @@
+                     self.adb.shell("input", "keyevent", "3", timeout=10)
+                 except Exception:
+                     pass
+-                time.sleep(0.4)
++                self._sleep(0.4)
+                 try:
+                     out2 = self.adb.start_app(self.package)
+                     self._log(f"restart venmo -> {(out2 or chr(32)).replace(chr(10), chr(32))[:120]}")
+@@ -257,7 +289,7 @@
+                     self.adb.start_app(self.package)
+                 except Exception:
+                     pass
+-        time.sleep(1.2)
++        self._sleep(1.2)
+ 
+ 
+     def _ime_shown(self) -> bool:
+@@ -276,7 +308,7 @@
+             self.adb.shell("input", "keyevent", "111", timeout=5)  # KEYCODE_ESCAPE
+         except Exception as e:
+             self._log(f"esc dismiss ime: {e}")
+-        time.sleep(0.2)
++        self._sleep(0.2)
+ 
+     def _hide_keyboard(self) -> None:
+         """兼容旧调用名。"""
+@@ -398,7 +430,7 @@
+                     self.adb.shell("input", "keyevent", "4", timeout=5)
+                 except Exception:
+                     pass
+-            time.sleep(1.0)
++            self._sleep(1.0)
+ 
+         # 0) 欢迎页则先进入表单
+         try:
+@@ -412,13 +444,13 @@
+             except Exception:
+                 xml_w = ""
+             self._tap_welcome_login(xml_w)
+-            time.sleep(2.0)
++            self._sleep(2.0)
+ 
+         # 1) 必须先收键盘，否则 Log in 在键盘后面
+         for _ in range(2):
+             if self._ime_shown():
+                 self._dismiss_ime_keep_form()
+-                time.sleep(0.35)
++                self._sleep(0.35)
+             else:
+                 break
+         # 额外 BACK 一次仅用于收键盘；若已在表单且无键盘则不动
+@@ -427,7 +459,7 @@
+                 self.adb.input_keyevent(4)
+             except Exception:
+                 pass
+-            time.sleep(0.4)
++            self._sleep(0.4)
+ 
+         _recover_forgot()
+ 
+@@ -477,7 +509,7 @@
+                 return False
+             self._log(f"{reason}: {tag} nextButton/LogIn bounds={btn} center=({cx},{cy}) single-tap")
+             self.adb.tap(cx, cy)
+-            time.sleep(0.9)
++            self._sleep(0.9)
+             return True
+ 
+         # 2) 单次点 nextButton，然后优先等待红框/加载，禁止立刻再点密码（会滚到 Forgot password）
+@@ -485,7 +517,7 @@
+             clicked = True
+             # 提交后轮询结果：有红框/验证/加载就立刻停，绝不再 focus 密码框
+             for wait_i in range(6):
+-                time.sleep(0.45 if wait_i == 0 else 0.55)
++                self._sleep(0.45 if wait_i == 0 else 0.55)
+                 if _left_form_or_result():
+                     return True
+                 try:
+@@ -502,7 +534,7 @@
+                     self._log(f"{reason}: submitting/loading after Log in, wait result (no password tap)")
+                     # 继续等结果，不进密码 ENTER
+                     for _ in range(20):
+-                        time.sleep(0.8)
++                        self._sleep(0.8)
+                         if _left_form_or_result():
+                             return True
+                         try:
+@@ -548,7 +580,7 @@
+             # 优先再点一次底部 Log in，而不是点密码框（点密码框容易滚到 Forgot）
+             if _tap_next_button_once(xml2, "retry-before-enter"):
+                 clicked = True
+-                time.sleep(1.0)
++                self._sleep(1.0)
+                 if _left_form_or_result():
+                     return True
+             else:
+@@ -561,7 +593,7 @@
+                         self._log(f"{reason}: ENTER once without re-focus password (avoid Forgot scroll)")
+                         self.adb.input_keyevent(66)
+                         clicked = True
+-                        time.sleep(1.2)
++                        self._sleep(1.2)
+                         if _left_form_or_result():
+                             return True
+                         _recover_forgot()
+@@ -576,7 +608,7 @@
+         # 4) 再收一次键盘后重点一次
+         if self._ime_shown():
+             self._dismiss_ime_keep_form()
+-            time.sleep(0.3)
++            self._sleep(0.3)
+         try:
+             xml3 = self.adb.uiautomator_dump(force=True) or ""
+         except Exception:
+@@ -623,13 +655,13 @@
+                 last = self.adb.ui_full_text()
+             except Exception as e:
+                 self._log(f"ui wait fail: {e}")
+-                time.sleep(1.5)
++                self._sleep(1.5)
+                 continue
+             low = last.lower()
+             for n in needles:
+                 if n.lower() in low:
+                     return last
+-            time.sleep(1.0)
++            self._sleep(1.0)
+         return last
+ 
+     def _tap_welcome_login(self, xml: str) -> bool:
+@@ -661,7 +693,7 @@
+                         return
+                     self.adb.tap_bounds(b)
+                     self._log(f"dismiss {key}")
+-                    time.sleep(0.45)
++                    self._sleep(0.45)
+                     xml_d = self.adb.uiautomator_dump()
+         except Exception:
+             pass
+@@ -679,7 +711,7 @@
+             self._force_stop_blockers()
+             try:
+                 self.adb.start_app(self.package)
+-                time.sleep(3.0)
++                self._sleep(3.0)
+             except Exception as e:
+                 self._log(f"magisk recover: {e}")
+             ui = self._wait_any_text(
+@@ -696,10 +728,10 @@
+                 self.adb.shell("input", "keyevent", "3", timeout=10)
+             except Exception:
+                 pass
+-            time.sleep(0.4)
++            self._sleep(0.4)
+             try:
+                 self.adb.start_app(self.package)
+-                time.sleep(3.0)
++                self._sleep(3.0)
+             except Exception as e:
+                 self._log(f"recover: {e}")
+             ui = self._wait_any_text(
+@@ -722,7 +754,7 @@
+             if self._on_credential_form(xml):
+                 return True
+             self._log("welcome Log in control not found")
+-        time.sleep(2.2)
++        self._sleep(2.2)
+         self._dismiss_system_dialogs()
+ 
+         deadline = time.time() + 18.0
+@@ -742,7 +774,7 @@
+                     self.adb.start_app(self.package)
+                 except Exception as e:
+                     self._log(f"recover start: {e}")
+-                time.sleep(2.5)
++                self._sleep(2.5)
+                 try:
+                     xml_r = self.adb.uiautomator_dump() or ""
+                 except Exception:
+@@ -760,7 +792,7 @@
+                             self.adb.tap(w // 2, int(h * 0.62))
+                     except Exception as e:
+                         self._log(f"welcome fallback: {e}")
+-                time.sleep(2.0)
++                self._sleep(2.0)
+                 continue
+             xml2 = self.adb.uiautomator_dump() or ""
+             if self._on_credential_form(xml2):
+@@ -773,8 +805,8 @@
+             if ("pay your people" in low or "pay for everything" in low) and "log in" in low:
+                 self._log("still on welcome, re-tap Log in")
+                 self._tap_welcome_login(xml2)
+-                time.sleep(1.5)
+-            time.sleep(1.0)
++                self._sleep(1.5)
++            self._sleep(1.0)
+ 
+         ui2 = ""
+         try:
+@@ -795,12 +827,12 @@
+                 self.adb.force_stop(self.package)
+             except Exception:
+                 pass
+-            time.sleep(0.6)
++            self._sleep(0.6)
+             try:
+                 self.adb.start_app(self.package)
+             except Exception as e:
+                 self._log(f"restart after form miss: {e}")
+-            time.sleep(2.5)
++            self._sleep(2.5)
+         self._save_debug("no_login_form")
+         return False
+ 
+@@ -821,10 +853,10 @@
+ 
+         self._log("fill email")
+         self.adb.tap_bounds(email_b)
+-        time.sleep(0.25)
++        self._sleep(0.25)
+         self.adb.clear_field(50)
+         self.adb.input_text_safe(account)
+-        time.sleep(0.4)
++        self._sleep(0.4)
+ 
+         # 更新 2026-07-24: 密码框可能在输入邮箱后短暂不可见，多策略+重试
+         pw_b = None
+@@ -855,7 +887,7 @@
+                 self.adb.tap_text("Password")
+             except Exception:
+                 pass
+-            time.sleep(0.7)
++            self._sleep(0.7)
+         if not pw_b:
+             self._log("password field not found")
+             self._save_debug("no_password_field")
+@@ -863,19 +895,19 @@
+ 
+         self._log("fill password")
+         self.adb.tap_bounds(pw_b)
+-        time.sleep(0.25)
++        self._sleep(0.25)
+         self.adb.clear_field(30)
+         self.adb.input_text_safe(password)
+-        time.sleep(0.35)
++        self._sleep(0.35)
+         # 填完密码立刻收键盘，避免页面被顶到 Forgot password 区域，并露出 Log in
+         self._dismiss_ime_keep_form()
+-        time.sleep(0.35)
++        self._sleep(0.35)
+ 
+         # 提交：收键盘后单次点 Log in（禁止 swipe）
+         self._early_result = None
+         self._early_message = ""
+         self._tap_login_submit(reason="first_submit")
+-        time.sleep(1.0)
++        self._sleep(1.0)
+         # 提交过程中已锁定红框结果（风控/错密/无网）→ 禁止二次提交
+         if self._early_result is not None and self._early_result != LoginResult.PENDING:
+             self._log(
+@@ -914,7 +946,7 @@
+                 self.adb.input_keyevent(4)
+             except Exception:
+                 pass
+-            time.sleep(0.8)
++            self._sleep(0.8)
+             self._tap_login_submit(reason="after_forgot_recover")
+         elif self._still_on_login_form(ui_chk, xml_chk):
+             # 仅当从未见过红框时才二次提交一次（网络慢）
+@@ -933,7 +965,7 @@
+                 low0 = (ui_chk or "").lower()
+                 _loading = ("this may take a few seconds" in low0) or ("may take a few seconds" in low0)
+             if not _loading:
+-                time.sleep(2.0)
++                self._sleep(2.0)
+                 try:
+                     xml2 = self.adb.uiautomator_dump(force=True) or xml_chk
+                 except Exception:
+@@ -1123,6 +1155,7 @@
+ 
+ 
+     def attempt_login(self, account: str, password: str) -> LoginOutcome:
++        self._check_cancelled()
+         self._log("登录尝试 account=%s" % account)
+         self._saw_success_candidate = False
+         self._success_candidate_phone = ""
+@@ -1203,6 +1236,7 @@
+                     ui_snippet=last_ui[:800],
+                 )
+         while time.time() < deadline:
++            self._check_cancelled()
+             # 红框已锁：零等待返回，避免界面停在表单上再被点到 Forgot password
+             if self._early_result in (
+                 LoginResult.WRONG_PASSWORD,
+@@ -1237,7 +1271,7 @@
+                     wrong_account=account if result == LoginResult.WRONG_PASSWORD else "",
+                     ui_snippet=last_ui[:800],
+                 )
+-            time.sleep(2.0 if getattr(self, "_saw_success_candidate", False) else 3.5)
++            self._sleep(2.0 if getattr(self, "_saw_success_candidate", False) else 3.5)
+             try:
+                 last_ui = self.adb.ui_full_text()
+             except Exception as exc:
+@@ -1252,7 +1286,7 @@
+                     self.adb.start_app(self.package)
+                 except Exception:
+                     pass
+-                time.sleep(2.0)
++                self._sleep(2.0)
+                 continue
+             if self._is_launcher_ui(last_ui):
+                 self._log("poll: launcher front, re-start Venmo only")
+@@ -1260,7 +1294,7 @@
+                     self.adb.start_app(self.package)
+                 except Exception:
+                     pass
+-                time.sleep(2.0)
++                self._sleep(2.0)
+                 continue
+ 
+             # 强制 dump 后重新取全文，尽量拿到完整掩码节点
+@@ -1334,7 +1368,7 @@
+                 # 验证页若掩码仍是短星号，多等一轮拿完整节点（最多额外 2 次由外循环承担）
+                 if phone and re.fullmatch(r"\*+\d{1,4}", phone) and (deadline - time.time()) > 8:
+                     self._log("verification page short mask=%r, wait fuller text" % (phone,))
+-                    time.sleep(2.0)
++                    self._sleep(2.0)
+                     continue
+                 self._log("verification/masked page detected phone=%r" % (phone,))
+                 self._save_debug("verification")
+@@ -1375,7 +1409,7 @@
+                     except Exception:
+                         xml_w = ""
+                     self._tap_welcome_login(xml_w)
+-                    time.sleep(2.0)
++                    self._sleep(2.0)
+                     continue
+                 if self._welcome_bounce_count >= 2:
+                     self._save_debug("welcome_bounce")
+@@ -1390,7 +1424,7 @@
+                 except Exception:
+                     xml_w = ""
+                 self._tap_welcome_login(xml_w)
+-                time.sleep(1.5)
++                self._sleep(1.5)
+                 continue
+ 
+             # 已锁定红框结果 或 验证页 不再重提
+@@ -1452,6 +1486,7 @@
+         max_timeout_rounds = 8
+         last = None
+         for round_i in range(1, max_timeout_rounds + 1):
++            self._check_cancelled()
+             self._log("login_with_fallback round=%s/%s a1=%s" % (round_i, max_timeout_rounds, account1))
+             first = self.attempt_login(account1, password)
+             last = first
+@@ -1478,6 +1513,7 @@
+         if last.result == LoginResult.WRONG_PASSWORD and account2:
+             self._log("账号1密码错误，改用账号2: %s" % account2)
+             for round_i in range(1, max_timeout_rounds + 1):
++                self._check_cancelled()
+                 second = self.attempt_login(account2, password)
+                 last = second
+                 if second.result in (LoginResult.SUCCESS, LoginResult.RISK_CONTROL):
+--- a/core/worker_engine.py
++++ b/core/worker_engine.py
+@@ -1,3 +1,4 @@
++# 2026-08-11 force-stop-no-tail-v1: 强停取消 Venmo 调用栈、退回当前账号、worker=0 后才报告完成；修复重复日志
+ # 2026-08-11 progressive-proxy-gate-v1: Worker 并发启动前测代理；可用 IP 先继续，不通刷新后每 10 秒多次复测
+ # 2026-07-31 immediate-stop-v1: force 停登录时打断 ADB，join 上限 8s
+ # 2026-07-25 layout-tight-v1: 登录线程一字紧贴排列 auto_fit margin=0
+@@ -59,7 +60,7 @@
+     check_socks5_proxy_host,
+ )
+ from core.root_setup import RootSetup
+-from core.venmo_login import VenmoLogin
++from core.venmo_login import LoginCancelled, VenmoLogin
+ from paths import DATA_SETUP_DIR, DATA_STATE_DIR, ensure_under_root
+ 
+ logger = logging.getLogger("mumuvenmo")
+@@ -82,7 +83,7 @@
+         self.store = store
+         self.proxy_pool = proxy_pool
+         self.config = config
+-        self.ui_log = ui_log or (lambda m: None)
++        self.ui_log = ui_log
+         self._stop = threading.Event()
+         self._stopping = False
+         self._threads: list[threading.Thread] = []
+@@ -98,6 +99,7 @@
+         self._vm_ops_lock = threading.Lock()
+         # 强制停止接管优雅停止等待
+         self._force_stop_event = threading.Event()
++        self._stop_reaper_started = False
+         # 同步代理池刷新参数
+         self._sync_proxy_config()
+ 
+@@ -115,11 +117,15 @@
+             pass
+ 
+     def log(self, msg: str) -> None:
++        # app_ui._log 本身会写同一个 logger；旧实现先 logger.info 再回调，
++        # 导致文件和实时日志每行重复两次。
++        if self.ui_log is not None:
++            try:
++                self.ui_log(msg)
++                return
++            except Exception:
++                pass
+         logger.info(msg)
+-        try:
+-            self.ui_log(msg)
+-        except Exception:
+-            pass
+ 
+     def stop(self) -> None:
+         """发送停止信号：不再领取新账号，当前登录任务会跑完。"""
+@@ -140,6 +146,38 @@
+     def current_logins(self) -> dict[str, str]:
+         with self._lock:
+             return dict(self._current_login)
++
++    def _finalize_stopped_state(self) -> bool:
++        """仅在所有 worker 真正退出后清理状态并允许下一轮启动。"""
++        if self.alive_workers() > 0:
++            return False
++        with self._lock:
++            self._current_login.clear()
++            self._threads = []
++            self.running = False
++            self._stopping = False
++            self._stop_reaper_started = False
++        self._force_stop_event.clear()
++        return True
++
++    def _start_stop_reaper(self) -> None:
++        """极端情况下后台等待残留 worker；退出前绝不把引擎标成已停止。"""
++        with self._lock:
++            if self._stop_reaper_started:
++                return
++            self._stop_reaper_started = True
++            threads = list(self._threads)
++
++        def _reap() -> None:
++            for thread in threads:
++                try:
++                    thread.join()
++                except Exception:
++                    pass
++            if self._finalize_stopped_state():
++                self.log("强制停止延迟收尾完成: workers=0，实时日志已停止")
++
++        threading.Thread(target=_reap, name="StopWorkerReaper", daemon=True).start()
+ 
+     def stop_and_shutdown(
+         self,
+@@ -179,7 +217,7 @@
+             except Exception as exc:
+                 self.log(f"强制停止中断 ADB 失败: {exc}")
+             join_timeout = min(float(join_timeout), 8.0)
+-            self.log(f"强制停止: join_timeout 压缩为 {join_timeout:.0f}s，已请求取消 ADB，超时后仍可关模拟器")
++            self.log(f"强制停止: join_timeout 压缩为 {join_timeout:.0f}s，已请求取消登录/ADB；仅 workers=0 后报告完成")
+         else:
+             # 新一轮优雅停止：清除旧强制标记
+             try:
+@@ -245,9 +283,9 @@
+         if alive_left:
+             self.log(
+                 f"警告: {alive_left} 个 worker 在超时后仍存活"
+-                + ("；强制停止将继续关模拟器并结束状态" if force else "；普通停止不关模拟器，请再点【强制停止】或继续等待")
++                + ("；强制停止将继续关模拟器并等待 worker 真正退出" if force else "；普通停止不关模拟器，请再点【强制停止】或继续等待")
+             )
+-            result["ok"] = False if not force else True
++            result["ok"] = False
+             result["forced_alive"] = alive_left
+         else:
+             self.log("所有 worker 已结束当前任务")
+@@ -284,15 +322,28 @@
+         elif not shutdown_vms:
+             self.log("配置为停止后不关闭模拟器")
+ 
+-        with self._lock:
+-            self._current_login.clear()
+-            self._threads = []
+-            self.running = False
+-            self._stopping = False
+-        try:
+-            self._force_stop_event.clear()
+-        except Exception:
+-            pass
++        # 关机后再给已取消的登录栈短暂收尾时间。旧版此处无条件清空
++        # self._threads，造成 UI 显示“已结束”但孤儿 worker 继续刷日志。
++        if force:
++            post_deadline = time.time() + 5.0
++            while time.time() < post_deadline:
++                alive = [t for t in self._threads if t.is_alive()]
++                if not alive:
++                    break
++                for t in alive:
++                    t.join(timeout=0.2)
++        alive_left = self.alive_workers()
++        result["alive_left"] = alive_left
++        result["joined"] = alive_left == 0
++        if alive_left:
++            result["ok"] = False
++            result["cleanup_pending"] = True
++            self.log(f"强制停止尚在收尾: alive_left={alive_left}，保持取消状态，不报告完成")
++            self._start_stop_reaper()
++            return result
++
++        self._finalize_stopped_state()
++        result["ok"] = not bool(result["shutdown_errors"])
+         self.log(
+             f"停止结束: joined={result['joined']} shutdown={result['shutdown']} "
+             f"skipped={result.get('shutdown_skipped')} errors={result['shutdown_errors']}"
+@@ -304,6 +355,8 @@
+         if self.running:
+             self.log("已在运行中")
+             return
++        # 上一轮强停会置全局 ADB cancel；新任务必须显式清掉。
++        AdbClient.clear_cancel_all()
+         self._stop.clear()
+         self._stopping = False
+         with self._lock:
+@@ -1469,6 +1522,7 @@
+             package=self.config.get("venmo_package", "com.venmo"),
+             login_timeout=int(self.config.get("login_timeout_seconds", 90)),
+             log=lambda m: self.log(f"{worker_id} {m}"),
++            cancel_check=lambda: self._force_stop_event.is_set(),
+         )
+         max_no_net_retry = int(self.config.get("no_network_retry_after_refresh", 1))
+         consecutive_limit = int(self.config.get("consecutive_risk_nonet_limit", 5) or 5)
+@@ -1678,6 +1732,15 @@
+                     )
+                     # rebind 已迁移代理，旧 key 不再 release
+                     return self._worker_loop(new_idx, worker_id)
++            except LoginCancelled:
++                self.store.release_without_result(acc)
++                consecutive_bad = 0
++                with self._lock:
++                    self._current_login.pop(worker_id, None)
++                self.log(
++                    f"{worker_id} 当前登录已强制取消 line={acc.line_no}，账号已退回待处理"
++                )
++                break
+             except Exception as exc:
+                 self.store.finish(acc, LoginResult.ERROR, message=str(exc)[:200])
+                 consecutive_bad = 0
+@@ -1686,16 +1749,21 @@
+                 self.log(f"{worker_id} 异常: {exc}")
+             finally:
+                 # 每账号结束后释放 UI，避免人工一点就卡白
+-                try:
+-                    adb.release_ui_control(home=False)
+-                except Exception:
+-                    pass
+-            time.sleep(1.0)
+-
+-        try:
+-            adb.release_ui_control(home=True)
+-        except Exception:
+-            pass
++                # 强停时全局 ADB 已取消，继续逐条执行清理命令只会制造大量
++                # "ADB ..." 尾日志；模拟器关机会完成资源回收。
++                if not self._force_stop_event.is_set():
++                    try:
++                        adb.release_ui_control(home=False)
++                    except Exception:
++                        pass
++            if self._stop.wait(1.0):
++                break
++
++        if not self._force_stop_event.is_set():
++            try:
++                adb.release_ui_control(home=True)
++            except Exception:
++                pass
+         with self._lock:
+             self._current_login.pop(worker_id, None)
+         self.proxy_pool.release(f"vm-{vmindex}")
