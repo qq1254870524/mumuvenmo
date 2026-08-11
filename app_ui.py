@@ -1,3 +1,8 @@
+# 2026-08-12 adb-flow-control-v1: 允许8台全部多开；启动逐台、ADB命令2路、登录工作流3路，避免请求风暴
+# 2026-08-12 proxy-reuse-autoassign-v1: 代理可自动均衡复用；4套代理可供8个Worker使用
+# 2026-08-12 staged-start-4plus4-v1: GUI 增加启动批次；8 台默认 4+4 有序放行，限制ADB启动拥堵
+# 2026-08-12 graceful-stop-v1: 第一次停止等待当前账号完成后关机；第二次才强制取消；停止回调前不提前恢复空闲
+# 2026-08-12 gui-live-vm-status-v1: 登录运行中每秒按实际可见 MuMu 窗口/当前账号/启动任务刷新 VM 状态，禁止长期显示启动前的 OFF 快照
 # 2026-08-11 force-stop-no-tail-v1: Worker 真正退出前保持“停止收尾中”，禁止提前显示停止完成；收尾线程归零后再恢复空闲
 # 2026-08-11 socks5-gui-pool-v3: 代理在线检查改为各 Worker 并发门禁；可用 IP 线程先启动，不通则刷新后每 10 秒多次复测
 # 2026-07-31 zombie-cancel-v2: Event代际 + provision捕获cancel，旧线程不因clear复活
@@ -46,7 +51,12 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 sys.dont_write_bytecode = True
 
-from core.account_store import AccountStore, load_accounts_from_file, load_accounts_from_text
+from core.account_store import (
+    AccountStore,
+    atomic_write_text,
+    load_accounts_from_file,
+    load_accounts_from_text,
+)
 from core.config_store import load_config, save_config
 from core.logger_util import UiLogBridge, setup_logger
 from core.mumu_manager import MuMuManager
@@ -180,10 +190,12 @@ class App(tk.Tk):
         self._bg_cancel = threading.Event()
         self._bg_title = ""
         self._stopping_ui = False
+        self._stop_job_active = False
         self._proxy_editor_rows: list[dict] = []
         self._proxy_preflight_in_progress = False
         self._proxy_preflight_passed = False
         self._vm_check_vars: dict[int, tk.BooleanVar] = {}
+        self._vm_check_widgets: dict[int, object] = {}
         self._vm_meta: dict[int, dict] = {}
         self._build_ui()
         self._bind_logger()
@@ -465,11 +477,15 @@ class App(tk.Tk):
         self.var_create_launch = tk.IntVar(value=int(self.cfg.get("create_launch_workers", 2)))
         ttk.Spinbox(top, from_=1, to=16, textvariable=self.var_create_launch, width=4).grid(row=0, column=5, padx=2)
 
+        ttk.Label(top, text="ADB命令并发").grid(row=0, column=6, sticky=tk.W, padx=(8, 0))
+        self.var_adb_workflow = tk.IntVar(value=int(self.cfg.get("adb_command_limit", 2) or 2))
+        ttk.Spinbox(top, from_=1, to=4, textvariable=self.var_adb_workflow, width=4).grid(row=0, column=7, padx=2)
+
         self.var_nekobox = tk.BooleanVar(value=bool(self.cfg.get("use_nekobox", True)))
-        ttk.Checkbutton(top, text="NekoBox", variable=self.var_nekobox).grid(row=0, column=6, padx=6)
+        ttk.Checkbutton(top, text="NekoBox", variable=self.var_nekobox).grid(row=0, column=8, padx=6)
 
         self.var_sort = tk.BooleanVar(value=bool(self.cfg.get("auto_sort_windows", True)))
-        ttk.Checkbutton(top, text="一行排列", variable=self.var_sort).grid(row=0, column=7, padx=4)
+        ttk.Checkbutton(top, text="一行排列", variable=self.var_sort).grid(row=0, column=9, padx=4)
 
         ttk.Label(top, text="定时重启(分,0=永久)").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
         self.var_restart = tk.DoubleVar(value=float(self.cfg.get("restart_interval_minutes", 0) or 0))
@@ -928,6 +944,19 @@ class App(tk.Tk):
 
     def _collect_cfg(self) -> dict:
         self.cfg["workers"] = int(self.var_workers.get())
+        self.cfg["max_active_vms"] = 8
+        self.cfg["adb_command_limit"] = min(
+            4, max(1, int(self.var_adb_workflow.get() or 2))
+        )
+        # 登录线程与 Worker 数量一致，不限制模拟器/账号流程数量。旧字段写成同值
+        # 仅用于兼容旧配置；拥堵由 adb_command_limit 的共享命令队列治理。
+        self.cfg["adb_workflow_limit"] = max(1, int(self.var_workers.get() or 1))
+        # 全部 VM 快速错峰派发；坏代理独立复测/换绑，不再阻塞后续健康 VM。
+        self.cfg["startup_wave_size"] = 1
+        self.cfg["startup_wave_settle_seconds"] = 8
+        # 代理池允许自动复用：代理少于 Worker 时按池顺序均衡分配，
+        # 代理可复用；ADB命令与整套登录工作流分别限流，模拟器数量不再硬截断。
+        self.cfg["allow_proxy_reuse"] = True
         self.cfg["create_count"] = int(self.var_create_count.get())
         self.cfg["create_launch_workers"] = int(self.var_create_launch.get())
         self.cfg["use_nekobox"] = bool(self.var_nekobox.get())
@@ -964,6 +993,54 @@ class App(tk.Tk):
             if parsed:
                 self.cfg["last_selected_vms"] = list(parsed)
         return self.cfg
+
+    def _validate_unique_proxy_capacity(self, ids: list[int], cfg: dict) -> tuple[bool, str]:
+        """校验代理池；复用模式只要求至少一套完整代理。"""
+        required = min(max(1, int(cfg.get("workers", 1) or 1)), len(ids))
+        if not bool(cfg.get("use_nekobox", True)):
+            return True, f"NekoBox未启用，Worker={required}"
+        profiles = list(getattr(self.proxy_pool, "proxies", []) or [])
+        unique: set[tuple] = set()
+        with_refresh = 0
+        for profile in profiles:
+            refresh = str(getattr(profile, "change_ip_url", "") or "").strip()
+            if not refresh:
+                continue
+            with_refresh += 1
+            unique.add(
+                (
+                    str(getattr(profile, "host", "") or "").strip().lower(),
+                    int(getattr(profile, "port", 0) or 0),
+                    str(getattr(profile, "username", "") or ""),
+                    str(getattr(profile, "password", "") or ""),
+                    refresh,
+                )
+            )
+        available = len(unique)
+        allow_reuse = bool(cfg.get("allow_proxy_reuse", True))
+        if allow_reuse:
+            if available < 1:
+                return (
+                    False,
+                    f"已选 {len(ids)} 台、登录线程 {required}，但没有带刷新链接的有效代理"
+                    f"（已解析 {len(profiles)} 套，带链接 {with_refresh} 套）。",
+                )
+            return (
+                True,
+                f"代理池容量通过: Worker={required} available={available} reuse=True；"
+                "代理将自动均衡分配",
+            )
+        if available < required:
+            return (
+                False,
+                f"已选 {len(ids)} 台、登录线程 {required}，但只有 {available} 套"
+                f"带刷新链接的唯一代理（已解析 {len(profiles)} 套，带链接 {with_refresh} 套）。"
+                f"按不复用规则还需补 {required - available} 套。",
+            )
+        return (
+            True,
+            f"唯一代理容量通过: Worker={required} available={available} reuse=False",
+        )
 
     def _parse_vm_text(self) -> list[int]:
         raw = (self.var_vms.get() or "").strip()
@@ -1025,6 +1102,7 @@ class App(tk.Tk):
             except Exception:
                 pass
         self._vm_check_vars.clear()
+        self._vm_check_widgets.clear()
         self._vm_meta.clear()
 
         if not indices:
@@ -1062,6 +1140,7 @@ class App(tk.Tk):
                 command=self._on_vm_check_changed,
             )
             cb.pack(side=tk.LEFT, padx=4, pady=2)
+            self._vm_check_widgets[i] = cb
 
         # 若 prefer 全都不在列表且用户未勾选，默认勾选全部（便于直接启动复用）
         if prefer_set and not any(i in prefer_set for i in indices):
@@ -1088,6 +1167,104 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _visible_vm_window_indices(self) -> set[int]:
+        """读取当前真实可见的数字标题 MuMu 窗口，不调用 MuMuManager/ADB。"""
+        if os.name != "nt":
+            return set()
+        found: set[int] = set()
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            enum_proc_type = ctypes.WINFUNCTYPE(
+                ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p
+            )
+
+            def _visit(hwnd, _lparam):
+                try:
+                    if not user32.IsWindowVisible(hwnd):
+                        return True
+                    length = int(user32.GetWindowTextLengthW(hwnd) or 0)
+                    if length <= 0 or length > 16:
+                        return True
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buf, length + 1)
+                    title = str(buf.value or "").strip()
+                    if title.isdigit():
+                        index = int(title)
+                        if index in self._vm_meta:
+                            found.add(index)
+                except Exception:
+                    pass
+                return True
+
+            callback = enum_proc_type(_visit)
+            user32.EnumWindows(callback, 0)
+        except Exception:
+            return set()
+        return found
+
+    def _refresh_live_vm_task_status(
+        self,
+        visible_indices: set[int] | None = None,
+    ) -> dict[int, str]:
+        """运行期间轻量刷新 VM 标签，且不重建勾选框/不改变用户选择。
+
+        状态优先级：LOGIN（当前正在处理账号） > ON（真实窗口存在） >
+        START（Worker 已分配、窗口尚未出现） > refresh_vms 保存的实际快照。
+        """
+        eng = self.engine
+        active: set[int] = set()
+        login: set[int] = set()
+        if eng and (eng.running or eng.alive_workers() > 0):
+            try:
+                active = {int(x) for x in eng.active_vm_indices()}
+            except Exception:
+                active = set()
+            try:
+                for worker_id in eng.current_logins().keys():
+                    match = re.search(r"(?:worker-|VM-?)(\d+)", str(worker_id), re.I)
+                    if match:
+                        login.add(int(match.group(1)))
+            except Exception:
+                login = set()
+        visible = (
+            {int(x) for x in visible_indices}
+            if visible_indices is not None
+            else self._visible_vm_window_indices()
+        )
+        display: dict[int, str] = {}
+        parts: list[str] = []
+        for index in sorted(self._vm_meta):
+            meta = self._vm_meta.get(index) or {}
+            base_state = str(meta.get("state") or "OFF")
+            if index in login:
+                state = "LOGIN"
+            elif index in visible:
+                state = "ON"
+            elif index in active:
+                state = "START"
+            else:
+                state = base_state
+            display[index] = state
+            meta["live_state"] = state
+            name = str(meta.get("name") or index)
+            text = f"{index}:{name}[{state}]"
+            parts.append(text)
+            widget = self._vm_check_widgets.get(index)
+            if widget is not None:
+                try:
+                    widget.configure(text=text)
+                except Exception:
+                    pass
+        try:
+            self.lbl_vms.configure(
+                text="模拟器: " + (" | ".join(parts) if parts else "(无)")
+            )
+        except Exception:
+            pass
+        return display
+
     def select_all_vms(self) -> None:
         for var in self._vm_check_vars.values():
             var.set(True)
@@ -1101,7 +1278,11 @@ class App(tk.Tk):
     def select_running_vms(self) -> None:
         any_on = False
         for idx, var in self._vm_check_vars.items():
-            on = bool(self._vm_meta.get(idx, {}).get("is_android_started"))
+            meta = self._vm_meta.get(idx, {})
+            live_state = str(meta.get("live_state") or "")
+            on = live_state in ("ON", "LOGIN") or bool(
+                meta.get("is_android_started")
+            )
             var.set(on)
             any_on = any_on or on
         if not any_on and self._vm_check_vars:
@@ -1968,7 +2149,7 @@ class App(tk.Tk):
         body = (text or "").replace("\r\n", "\n").replace("\r", "\n")
         if body and not body.endswith("\n"):
             body += "\n"
-        path.write_text(body, encoding="utf-8")
+        atomic_write_text(path, body, encoding="utf-8")
         self.store.set_source_path(path)
         return path
 
@@ -2152,14 +2333,6 @@ class App(tk.Tk):
         if self.engine and (self.engine.running or self.engine.is_stopping()):
             messagebox.showwarning("提示", "已在登录中或正在停止，请先等待结束")
             return
-        if self._proxy_preflight_in_progress:
-            return
-        if self._proxy_preflight_passed:
-            # 只放行这一次递归启动；下次点击仍重新做启动前检查。
-            self._proxy_preflight_passed = False
-        elif self._begin_proxy_preflight():
-            return
-
         # 刷新列表，确保勾选对应当前已有实例
         try:
             self.refresh_vms()
@@ -2185,6 +2358,22 @@ class App(tk.Tk):
         ids = [i for i in ids if i in exist]
         if not ids:
             messagebox.showwarning("提示", "勾选的模拟器已不存在，请刷新后重选")
+            return
+
+        proxy_capacity_ok, proxy_capacity_msg = self._validate_unique_proxy_capacity(ids, cfg)
+        self._log(proxy_capacity_msg)
+        if not proxy_capacity_ok:
+            messagebox.showwarning("代理池不可用", proxy_capacity_msg)
+            return
+        self.proxy_pool.allow_reuse = bool(cfg.get("allow_proxy_reuse", True))
+
+        # 容量通过后再测连通性；代理少于 Worker 时由代理池自动均衡复用。
+        if self._proxy_preflight_in_progress:
+            return
+        if self._proxy_preflight_passed:
+            # 只放行这一次递归启动；下次点击仍重新做启动前检查。
+            self._proxy_preflight_passed = False
+        elif self._begin_proxy_preflight():
             return
 
         self.cfg["last_selected_vms"] = list(ids)
@@ -2237,11 +2426,13 @@ class App(tk.Tk):
             self._set_run_buttons(running=False, stopping=False)
             self._log("没有运行中的登录引擎")
             self._stopping_ui = False
+            self._stop_job_active = False
             return
 
         # 第二次点击：强制停止
         if self._stopping_ui:
             self._log("检测到再次点击停止 → 强制停止（打断当前 NekoBox/登录等待）")
+            self._stop_job_active = True
             try:
                 eng.stop()
             except Exception as exc:
@@ -2265,6 +2456,7 @@ class App(tk.Tk):
             return
 
         self._stopping_ui = True
+        self._stop_job_active = True
         self._set_run_buttons(running=True, stopping=True)
         # 停止中仍允许再点一次强制停止
         try:
@@ -2277,57 +2469,31 @@ class App(tk.Tk):
         except Exception as exc:
             self._log(f"发送停止信号失败: {exc}")
 
-        # immediate-stop-v1: 第一次点击即强制停止（短 join），不再卡 1800s
-        join_timeout = float(self.cfg.get("stop_force_join_timeout_seconds", 8) or 8)
-        if join_timeout < 3:
-            join_timeout = 8.0
-        if join_timeout > 30:
+        # 第一次点击只发送“不再领新号”的优雅停止信号。当前账号继续完成并
+        # 正常写入分类结果，然后 Worker 退出、模拟器关机。第二次点击才走上面
+        # 的 force=True 分支打断 ADB/Venmo。
+        join_timeout = float(self.cfg.get("stop_join_timeout_seconds", 1800) or 1800)
+        if join_timeout < 30:
             join_timeout = 30.0
         shutdown_vms = bool(self.cfg.get("stop_shutdown_vms", True))
         self._log(
-            f"停止中: 立即强制停止（最长等待 {join_timeout:.0f}s），"
+            f"停止中: 等待当前账号完成（最长等待 {join_timeout:.0f}s），"
             f"{'完成后关闭' if shutdown_vms else '完成后不关闭'}模拟器。"
         )
-        try:
-            from core.adb_client import AdbClient
-            AdbClient.request_cancel_all()
-            killed = AdbClient.interrupt_all()
-            self._log(f"[停止登录] 已中断活动 ADB killed={killed}")
-        except Exception as exc:
-            self._log(f"停止时中断 ADB 失败: {exc}")
-
-        def _pulse_login_kill() -> None:
-            try:
-                from core.adb_client import AdbClient as _Adb
-            except Exception:
-                return
-            for _i in range(30):
-                try:
-                    if not getattr(self, "_stopping_ui", False):
-                        break
-                    _Adb.request_cancel_all()
-                    _Adb.interrupt_all()
-                except Exception:
-                    pass
-                time.sleep(0.3)
-        try:
-            threading.Thread(target=_pulse_login_kill, name="stop-login-pulse", daemon=True).start()
-        except Exception:
-            pass
 
         def job() -> None:
             try:
                 result = eng.stop_and_shutdown(
                     join_timeout=join_timeout,
                     shutdown_vms=shutdown_vms,
-                    force=True,
+                    force=False,
                 )
             except Exception as exc:
-                result = {"ok": False, "error": str(exc), "force": True}
-                self._log(f"强制停止异常: {exc}")
+                result = {"ok": False, "error": str(exc), "force": False}
+                self._log(f"等待当前账号停止异常: {exc}")
             self.after(0, lambda: self._on_stop_done(result))
 
-        threading.Thread(target=job, name="stop-login-force1", daemon=True).start()
+        threading.Thread(target=job, name="stop-login-graceful", daemon=True).start()
 
     def _on_stop_done(self, result: dict | None = None) -> None:
         result = result or {}
@@ -2337,6 +2503,7 @@ class App(tk.Tk):
             return
         # 普通停止超时且未关模拟器：保持“停止中”，当前登录继续，可再点强制停止
         if result.get("shutdown_skipped") and not result.get("force"):
+            self._stop_job_active = False
             self._stopping_ui = True
             self._set_run_buttons(running=True, stopping=True)
             try:
@@ -2354,6 +2521,7 @@ class App(tk.Tk):
         # stop-reaper 会保留取消信号并等待真实退出；UI 同步等到 workers=0。
         alive_left = int(result.get("alive_left") or 0)
         if result.get("cleanup_pending") or alive_left > 0 or not result.get("joined", False):
+            self._stop_job_active = False
             self._stopping_ui = True
             self._set_run_buttons(running=True, stopping=True)
             try:
@@ -2367,6 +2535,7 @@ class App(tk.Tk):
             )
             self.after(300, self._poll_engine_state)
             return
+        self._stop_job_active = False
         self._stopping_ui = False
         self._set_run_buttons(running=False, stopping=False)
         if result.get("ok"):
@@ -2390,6 +2559,12 @@ class App(tk.Tk):
         """登录运行期间轮询引擎状态；全部结束后恢复按钮。"""
         eng = self.engine
         if self._stopping_ui:
+            # stop_and_shutdown 仍在等待当前账号或正在关机时，即使 Worker 已归零，
+            # 也必须等它的完成回调再恢复空闲；旧版会提前显示“停止完成”，随后
+            # start_login 又读到旧 stop Event，造成状态自相矛盾。
+            if getattr(self, "_stop_job_active", False):
+                self.after(300, self._poll_engine_state)
+                return
             alive = eng.alive_workers() if eng else 0
             if alive > 0:
                 self.after(300, self._poll_engine_state)
@@ -2402,6 +2577,7 @@ class App(tk.Tk):
             except Exception as exc:
                 self._log(f"停止收尾状态同步警告: {exc}")
             self._stopping_ui = False
+            self._stop_job_active = False
             self._set_run_buttons(running=False, stopping=False)
             self._log("强制停止完成: workers=0，实时日志已停止")
             try:
@@ -2412,7 +2588,9 @@ class App(tk.Tk):
         if not eng:
             self._set_run_buttons(running=False, stopping=False)
             return
-        if eng.running or eng.alive_workers() > 0:
+        # running 是本轮已启动标记，不会由最后一个 Worker 自动改回 False；
+        # 真实运行态必须以存活 Worker 为准，否则自然结束后会永远被判为登录中。
+        if eng.alive_workers() > 0:
             # 可选：状态栏显示当前登录
             try:
                 cur = eng.current_logins()
@@ -2420,6 +2598,12 @@ class App(tk.Tk):
                     self.lbl_export.configure(
                         text="登录中: " + ", ".join(f"{k}={v}" for k, v in list(cur.items())[:4])
                     )
+            except Exception:
+                pass
+            # 不再让 VM 勾选框/底部状态长期停在启动前的 OFF 快照；该刷新只读
+            # 当前窗口与 Engine 内存状态，不调用 MuMuManager/ADB，也不改变勾选。
+            try:
+                self._refresh_live_vm_task_status()
             except Exception:
                 pass
             # 登录过程中兜底刷新导入文本（finish 回调为主，轮询防漏）
@@ -2435,7 +2619,13 @@ class App(tk.Tk):
                 pass
             self.after(1000, self._poll_engine_state)
             return
-        # 自然结束
+        # 自然结束：同步归零 Engine 的 running/stopping/stop Event，保证可立即再开。
+        try:
+            finalize = getattr(eng, "_finalize_stopped_state", None)
+            if callable(finalize):
+                finalize()
+        except Exception as exc:
+            self._log(f"登录结束状态同步警告: {exc}")
         self._set_run_buttons(running=False, stopping=False)
         self._log("登录引擎已全部结束")
         try:

@@ -1,3 +1,4 @@
+# 2026-08-11 atomic-source-write-v1: 导入源使用同目录临时文件+fsync+os.replace，读者不再看到截断中间态
 # -*- coding: utf-8 -*-
 """账号解析、线程安全分配、四类实时分类导出。
 
@@ -24,8 +25,11 @@
 from __future__ import annotations
 
 import csv
+import os
 import re
+import tempfile
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -93,6 +97,77 @@ FINISHED_EXPORT_NAMES = (
     EXPORT_WRONG_NAME,
     EXPORT_NONET_NAME,
 )
+
+
+def atomic_write_text(
+    path: str | Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    replace_retries: int = 40,
+    retry_delay: float = 0.025,
+) -> Path:
+    """把完整文本原子替换到目标路径，杜绝外部读取到截断/半写文件。
+
+    临时文件必须与目标位于同一目录，写完 flush+fsync 后才 os.replace。
+    Windows 上若杀毒/监控程序短暂占用目标，针对 sharing violation 做短重试；
+    任何失败都保留原目标，并清理本次临时文件。
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    old_mode = None
+    try:
+        if target.exists():
+            old_mode = target.stat().st_mode
+    except Exception:
+        old_mode = None
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+    )
+    tmp_path = Path(tmp_name)
+    replaced = False
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        fd = -1
+        if old_mode is not None:
+            try:
+                os.chmod(tmp_path, old_mode)
+            except Exception:
+                pass
+
+        attempts = max(1, int(replace_retries or 1))
+        last_error = None
+        for attempt in range(attempts):
+            try:
+                os.replace(tmp_path, target)
+                replaced = True
+                return target
+            except OSError as exc:
+                last_error = exc
+                retryable = isinstance(exc, PermissionError) or getattr(
+                    exc, "winerror", None
+                ) in (5, 32, 33)
+                if (not retryable) or attempt >= attempts - 1:
+                    raise
+                time.sleep(max(0.001, float(retry_delay)))
+        if last_error is not None:
+            raise last_error
+        return target
+    finally:
+        if fd not in (-1, None):
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        if not replaced:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def account_key_of_line(s: str) -> str:
@@ -835,7 +910,7 @@ class AccountStore:
             new_lines.append(line)
         if removed:
             try:
-                path.write_text("".join(new_lines), encoding="utf-8")
+                atomic_write_text(path, "".join(new_lines), encoding="utf-8")
             except Exception:
                 return 0
         return removed
@@ -1062,7 +1137,7 @@ class AccountStore:
 
         content = ('\n'.join(lines) + ('\n' if lines else ''))
         try:
-            path.write_text(content, encoding="utf-8")
+            atomic_write_text(path, content, encoding="utf-8")
         except Exception:
             return 0
         return len(lines)

@@ -13,6 +13,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "mumu_manager": str(DEFAULT_MUMU_MANAGER),
     "adb_path": str(DEFAULT_ADB),
     "workers": 3,
+    # Worker/模拟器/登录流程全部按 workers 运行；只限制同时在飞的 adb.exe。
+    "max_active_vms": 8,
+    "adb_workflow_limit": 8,
+    "adb_command_limit": 2,
+    # 只做8秒错峰派发；代理检查、启动、登录各自继续，不相互堵塞。
+    "startup_wave_size": 1,
+    "startup_wave_settle_seconds": 8,
+    # 代理少于 Worker 时按池顺序均衡复用；ADB由命令级 broker 背压。
+    "allow_proxy_reuse": True,
     "create_count": 1,
     "create_launch_workers": 2,
     "use_nekobox": True,

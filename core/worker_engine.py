@@ -1,3 +1,8 @@
+# 2026-08-12 startup-proxy-failover-v1: 启动代理不通时隔离该代理并自动换绑健康代理，不再结束对应Worker
+# 2026-08-12 adb-flow-control-v1: 8台全部多开；逐台准备、ADB命令2路、登录工作流3路，杜绝并发请求风暴
+# 2026-08-12 proxy-reuse-autoassign-v1: Worker多于代理时自动均衡复用，刷新冷却仍按链接共享
+# 2026-08-12 staged-start-4plus4-v1: 8 Worker 按 4+4 波次启动；上一批进入登录后才放下一批，避免 package/ADB 拥堵
+# 2026-08-12 graceful-stop-reset-v1: 停止完全结束后清除本轮 stop/ADB cancel，下一轮可直接启动
 # 2026-08-11 force-stop-no-tail-v1: 强停取消 Venmo 调用栈、退回当前账号、worker=0 后才报告完成；修复重复日志
 # 2026-08-11 progressive-proxy-gate-v1: Worker 并发启动前测代理；可用 IP 先继续，不通刷新后每 10 秒多次复测
 # 2026-07-31 immediate-stop-v1: force 停登录时打断 ADB，join 上限 8s
@@ -100,6 +105,31 @@ class WorkerEngine:
         # 强制停止接管优雅停止等待
         self._force_stop_event = threading.Event()
         self._stop_reaper_started = False
+        # 启动波次协调：全部 Worker 线程仍一次创建，但后续波次在任何 ADB/
+        # 代理操作之前等待。这样停止/join 仍能完整覆盖全部线程。
+        self._startup_wave_lock = threading.RLock()
+        self._startup_waves: list[list[str]] = []
+        self._startup_wave_events: list[threading.Event] = []
+        self._startup_wave_by_worker: dict[str, int] = {}
+        self._startup_wave_ready: dict[int, set[str]] = {}
+        self._startup_wave_terminal: dict[int, set[str]] = {}
+        self._startup_wave_release_at: dict[int, float] = {}
+        self._startup_wave_settle_seconds = 15.0
+        # 登录线程数严格跟随 GUI workers：8 个线程就让 8 个 VM 都领取账号并
+        # 推进流程。真正会挤爆共享 adb server 的是“同时在飞的 adb 子进程”，
+        # 该压力由 AdbClient 的全局命令队列治理，不能再拿 Worker/模拟器数量限流。
+        self._adb_workflow_limit = max(
+            1, int(self.config.get("workers", 1) or 1)
+        )
+        self._adb_workflow_slots = threading.BoundedSemaphore(self._adb_workflow_limit)
+        self._adb_workflow_holders: set[str] = set()
+        self._adb_workflow_lock = threading.RLock()
+        # 本轮启动已经多次复测失败的代理进入隔离集。后续 Worker 即使被
+        # ProxyPool.assign 分到它，也会直接换绑，不再重复等待50秒后退出。
+        self._startup_bad_proxy_names: set[str] = set()
+        AdbClient.configure_global_limit(
+            int(self.config.get("adb_command_limit", 2) or 2)
+        )
         # 同步代理池刷新参数
         self._sync_proxy_config()
 
@@ -112,6 +142,9 @@ class WorkerEngine:
                 refresh_wait_seconds=float(
                     self.config.get("proxy_refresh_wait_seconds", 5)
                 ),
+            )
+            self.proxy_pool.allow_reuse = bool(
+                self.config.get("allow_proxy_reuse", True)
             )
         except Exception:
             pass
@@ -126,6 +159,226 @@ class WorkerEngine:
             except Exception:
                 pass
         logger.info(msg)
+
+    def _acquire_adb_workflow_slot(self, worker_id: str, vmindex: int) -> bool:
+        """停止可打断的登录工作流门禁；不影响模拟器保持多开。"""
+        waiting_logged = False
+        while not self._stop.is_set():
+            if self._adb_workflow_slots.acquire(timeout=0.25):
+                with self._adb_workflow_lock:
+                    self._adb_workflow_holders.add(worker_id)
+                    active = len(self._adb_workflow_holders)
+                self.log(
+                    f"{worker_id} VM={vmindex} 获得ADB登录槽位 "
+                    f"active={active}/{self._adb_workflow_limit}"
+                )
+                return True
+            if not waiting_logged:
+                waiting_logged = True
+                self.log(
+                    f"{worker_id} VM={vmindex} 等待ADB登录槽位；"
+                    f"模拟器保持运行，当前不发送ADB命令 limit={self._adb_workflow_limit}"
+                )
+        return False
+
+    def _release_adb_workflow_slot(self, worker_id: str, vmindex: int) -> None:
+        with self._adb_workflow_lock:
+            held = worker_id in self._adb_workflow_holders
+            if held:
+                self._adb_workflow_holders.remove(worker_id)
+            active = len(self._adb_workflow_holders)
+        if not held:
+            return
+        self._adb_workflow_slots.release()
+        self.log(
+            f"{worker_id} VM={vmindex} 释放ADB登录槽位 "
+            f"active={active}/{self._adb_workflow_limit}"
+        )
+
+    def _startup_proxy_with_failover(self, worker_id: str, vmindex: int, proxy):
+        """启动前代理门禁失败时整包换绑，返回 ``(proxy, result)``。"""
+        max_try = max(1, len(getattr(self.proxy_pool, "proxies", []) or []))
+        tried: set[str] = set()
+        current = proxy
+        last = {"ok": False, "status": "no_proxy"}
+        for attempt in range(1, max_try + 1):
+            if self._stop.is_set() or current is None:
+                break
+            name = str(getattr(current, "profile_name", "") or "")
+            with self._lock:
+                quarantined = name in self._startup_bad_proxy_names
+            if quarantined:
+                last = {"ok": False, "status": "quarantined_previous_failure"}
+                self.log(
+                    f"{worker_id} VM={vmindex} 跳过已隔离代理#{self.proxy_pool.number_of(current)} "
+                    f"profile={name}"
+                )
+            else:
+                last = self._startup_proxy_preflight(worker_id, current)
+                if bool(last.get("ok")):
+                    with self._lock:
+                        self._vm_proxy[int(vmindex)] = current
+                    return current, last
+                with self._lock:
+                    self._startup_bad_proxy_names.add(name)
+                self.log(
+                    f"{worker_id} VM={vmindex} 隔离启动失败代理#{self.proxy_pool.number_of(current)} "
+                    f"profile={name} status={last.get('status')}"
+                )
+
+            tried.add(name)
+            with self._lock:
+                excluded = set(self._startup_bad_proxy_names)
+            excluded.update(tried)
+            try:
+                alt = self.proxy_pool.reassign(
+                    f"vm-{vmindex}", exclude_names=excluded
+                )
+            except Exception as exc:
+                self.log(f"{worker_id} VM={vmindex} 启动代理自动换绑异常: {exc}")
+                alt = None
+            alt_name = str(getattr(alt, "profile_name", "") or "") if alt else ""
+            if alt is None or not alt_name or alt_name in tried:
+                break
+            current = alt
+            with self._lock:
+                self._vm_proxy[int(vmindex)] = current
+            self.log(
+                f"{worker_id} VM={vmindex} 启动代理自动换绑 attempt={attempt}/{max_try} "
+                f"-> 代理#{self.proxy_pool.number_of(current)} profile={alt_name} "
+                f"change_ip={'yes' if getattr(current, 'change_ip_url', '') else 'no'}"
+            )
+        return None, last
+
+    def _prepare_startup_waves(self, use: list[int]) -> list[int]:
+        """按选中顺序把 Worker 分波；返回每个 Worker 对应的 wave index。"""
+        size = max(1, int(self.config.get("startup_wave_size", 4) or 4))
+        size = min(size, max(1, len(use)))
+        settle = max(
+            0.0,
+            float(self.config.get("startup_wave_settle_seconds", 15) or 0),
+        )
+        worker_ids = [f"worker-{i}" for i in range(len(use))]
+        waves = [worker_ids[i : i + size] for i in range(0, len(worker_ids), size)]
+        with self._startup_wave_lock:
+            self._startup_waves = waves
+            self._startup_wave_events = [threading.Event() for _ in waves]
+            if self._startup_wave_events:
+                self._startup_wave_events[0].set()
+            self._startup_wave_by_worker = {
+                worker_id: wave_index
+                for wave_index, members in enumerate(waves)
+                for worker_id in members
+            }
+            self._startup_wave_ready = {i: set() for i in range(len(waves))}
+            self._startup_wave_terminal = {i: set() for i in range(len(waves))}
+            self._startup_wave_release_at = {0: time.monotonic()}
+            self._startup_wave_settle_seconds = settle
+        mapping = [self._startup_wave_by_worker[w] for w in worker_ids]
+        pretty = [
+            [int(use[int(worker_id.split("-")[-1])]) for worker_id in members]
+            for members in waves
+        ]
+        self.log(
+            f"有序启动派发: size={size} settle={settle:.0f}s waves={pretty}；"
+            "只错峰启动/代理检查，不限制模拟器数量和登录线程数量"
+        )
+        return mapping
+
+    def _wait_startup_wave(self, worker_id: str, vmindex: int, wave_index: int) -> bool:
+        with self._startup_wave_lock:
+            event = self._startup_wave_events[wave_index]
+            total = len(self._startup_waves)
+        if wave_index > 0:
+            self.log(
+                f"{worker_id} VM={vmindex} 等待启动派发 {wave_index + 1}/{total}；"
+                "仅错峰，放行后独立测代理/启动，不占用其他 VM 名额"
+            )
+        while not self._stop.is_set():
+            if event.wait(0.25):
+                break
+        if self._stop.is_set():
+            self.log(f"{worker_id} VM={vmindex} 等待启动波次时任务已停止")
+            return False
+        while not self._stop.is_set():
+            with self._startup_wave_lock:
+                release_at = float(
+                    self._startup_wave_release_at.get(wave_index, time.monotonic())
+                )
+            remaining = release_at - time.monotonic()
+            if remaining <= 0:
+                break
+            if self._stop.wait(min(0.25, remaining)):
+                return False
+        if self._stop.is_set():
+            return False
+        self.log(f"{worker_id} VM={vmindex} 启动派发 {wave_index + 1}/{total} 已放行")
+        return True
+
+    def _advance_startup_wave(self, wave_index: int) -> None:
+        message = ""
+        with self._startup_wave_lock:
+            if self._stop.is_set() or wave_index >= len(self._startup_waves) - 1:
+                return
+            members = set(self._startup_waves[wave_index])
+            done = set(self._startup_wave_ready.get(wave_index, set()))
+            done.update(self._startup_wave_terminal.get(wave_index, set()))
+            if not members.issubset(done):
+                return
+            next_index = wave_index + 1
+            event = self._startup_wave_events[next_index]
+            if event.is_set():
+                return
+            release_at = time.monotonic() + self._startup_wave_settle_seconds
+            self._startup_wave_release_at[next_index] = release_at
+            event.set()
+            ready = sorted(self._startup_wave_ready.get(wave_index, set()))
+            terminal = sorted(self._startup_wave_terminal.get(wave_index, set()))
+            message = (
+                f"启动派发 {wave_index + 1} 已提交 ready={ready} ended={terminal}；"
+                f"{self._startup_wave_settle_seconds:.0f}s 后放行派发 {next_index + 1}"
+            )
+        if message:
+            self.log(message)
+
+    def _mark_startup_wave_ready(self, worker_id: str, vmindex: int) -> None:
+        with self._startup_wave_lock:
+            wave_index = self._startup_wave_by_worker.get(worker_id)
+            if wave_index is None:
+                return
+            bucket = self._startup_wave_ready.setdefault(wave_index, set())
+            first = worker_id not in bucket
+            bucket.add(worker_id)
+            total = len(self._startup_waves[wave_index])
+            count = len(bucket)
+        if first:
+            self.log(
+                f"{worker_id} VM={vmindex} 已进入独立启动队列，"
+                f"启动派发 {wave_index + 1} ready={count}/{total}"
+            )
+        self._advance_startup_wave(wave_index)
+
+    def _mark_startup_wave_terminal(self, worker_id: str, vmindex: int) -> None:
+        with self._startup_wave_lock:
+            wave_index = self._startup_wave_by_worker.get(worker_id)
+            if wave_index is None:
+                return
+            self._startup_wave_terminal.setdefault(wave_index, set()).add(worker_id)
+        self._advance_startup_wave(wave_index)
+
+    def _staged_worker_entry(
+        self, vmindex: int, worker_id: str, wave_index: int
+    ) -> None:
+        try:
+            if not self._wait_startup_wave(worker_id, vmindex, wave_index):
+                return
+            # 只要本 Worker 已被错峰派发，就立即释放下一派发计时。代理检查、
+            # MuMu 启动和 ADB 等待随后由本 Worker 独立完成；坏代理不再把后面
+            # 的健康 VM 全部堵在“未启动”状态。
+            self._mark_startup_wave_ready(worker_id, vmindex)
+            self._worker_loop(vmindex, worker_id)
+        finally:
+            self._mark_startup_wave_terminal(worker_id, vmindex)
 
     def stop(self) -> None:
         """发送停止信号：不再领取新账号，当前登录任务会跑完。"""
@@ -157,7 +410,16 @@ class WorkerEngine:
             self.running = False
             self._stopping = False
             self._stop_reaper_started = False
+        # start_login() 在创建下一轮 Engine 前会先检查 is_stopping()。
+        # 旧版只清 _stopping，却把 _stop Event 永久保留为 set，导致界面已显示
+        # “停止完成/空闲”后仍弹“已在登录中或正在停止”。停止完全结束时必须
+        # 同步清除本 Engine 和全局 ADB 的取消代际。
+        self._stop.clear()
         self._force_stop_event.clear()
+        try:
+            AdbClient.clear_cancel_all()
+        except Exception:
+            pass
         return True
 
     def _start_stop_reaper(self) -> None:
@@ -364,12 +626,39 @@ class WorkerEngine:
         self.running = True
         self._vm_indices = list(vm_indices)
         self._sync_proxy_config()
-        workers = min(int(self.config.get("workers", 3)), len(self._vm_indices) or 1)
+        requested_workers = min(
+            int(self.config.get("workers", 3)), len(self._vm_indices) or 1
+        )
         if not self._vm_indices:
             self.log("没有可用模拟器索引，请先选择或新建")
             self.running = False
             return
+        # 不再截断模拟器数量：8台全部启动。拥堵由逐台启动波次、ADB命令
+        # 2路和登录工作流槽位共同治理。
+        workers = requested_workers
         use = self._vm_indices[:workers]
+        self.log(
+            f"ADB流控: 多开={len(use)}、登录线程={len(use)} 全部运行；启动派发="
+            f"{int(self.config.get('startup_wave_size', 1) or 1)}，"
+            f"ADB命令并发={AdbClient.global_limit()}"
+        )
+        if bool(self.config.get("use_nekobox", True)) and not bool(
+            self.config.get("allow_proxy_reuse", True)
+        ):
+            unique_available = len(
+                {
+                    (p.host, int(p.port), p.username, p.password, p.change_ip_url)
+                    for p in (getattr(self.proxy_pool, "proxies", []) or [])
+                    if str(getattr(p, "change_ip_url", "") or "").strip()
+                }
+            )
+            if unique_available < len(use):
+                self.log(
+                    f"启动拦截: Worker={len(use)}，带刷新链接的唯一代理={unique_available}；"
+                    "禁止复用代理，请补齐后再启动"
+                )
+                self.running = False
+                return
         self.log(f"启动 {len(use)} 个工作线程, VM={use}")
         self.log(
             "代理刷新规则: Worker 启动前不通会刷一次；运行中仅风控/无网络刷 IP; "
@@ -390,12 +679,13 @@ class WorkerEngine:
             except Exception as exc:
                 self.log(f"窗口排列警告: {exc}")
 
+        wave_mapping = self._prepare_startup_waves(use)
         self._threads = []
         for i, vmindex in enumerate(use):
             t = threading.Thread(
-                target=self._worker_loop,
+                target=self._staged_worker_entry,
                 name=f"VM-{vmindex}",
-                args=(vmindex, f"worker-{i}"),
+                args=(vmindex, f"worker-{i}", wave_mapping[i]),
                 daemon=True,
             )
             self._threads.append(t)
@@ -948,8 +1238,10 @@ class WorkerEngine:
             pass
         profile_name = proxy.profile_name if proxy else ""
         if proxy:
+            proxy_number = self.proxy_pool.number_of(proxy)
             self.log(
-                f"{worker_id} 预绑定SOCKS5配置(仅内存，未打开代理UI) "
+                f"{worker_id} VM={vmindex} 使用代理#{proxy_number}；"
+                "预绑定SOCKS5配置(仅内存，未打开代理UI) "
                 f"profile={profile_name} ({proxy.masked()})"
             )
         else:
@@ -958,7 +1250,10 @@ class WorkerEngine:
         # 每个 Worker 在启动模拟器前独立做代理门禁。线程并发执行，因此健康 IP
         # 立即继续；慢/坏 IP 只阻塞自己的 Worker，不再拖住全部线程。
         if bool(self.config.get("use_nekobox", True)):
-            startup_proxy = self._startup_proxy_preflight(worker_id, proxy)
+            proxy, startup_proxy = self._startup_proxy_with_failover(
+                worker_id, vmindex, proxy
+            )
+            profile_name = str(getattr(proxy, "profile_name", "") or "")
             if not bool(startup_proxy.get("ok")):
                 self.log(
                     f"{worker_id} 启动前代理多次复测仍未通过 "
@@ -976,7 +1271,8 @@ class WorkerEngine:
                     pass
                 return
             self.log(
-                f"{worker_id} 启动前代理已连通 profile={profile_name} "
+                f"{worker_id} VM={vmindex} 启动前代理已连通 "
+                f"代理#{self.proxy_pool.number_of(proxy)} profile={profile_name} "
                 f"status={startup_proxy.get('status')}，立即启动本线程"
             )
 
@@ -1263,7 +1559,8 @@ class WorkerEngine:
             # 模拟器 + SOCKS5 + 刷新链接绑定在本 worker 的 proxy 上
             try:
                 self.log(
-                    f"{worker_id} [STEP3] NekoBox 绑定 profile={proxy.profile_name} "
+                    f"{worker_id} [STEP3] VM={vmindex} 使用代理#{self.proxy_pool.number_of(proxy)}；"
+                    f"NekoBox 绑定 profile={proxy.profile_name} "
                     f"endpoint={proxy.host}:{proxy.port} change_ip={'yes' if proxy.change_ip_url else 'no'}"
                 )
                 # 导入 NekoBox 前：主机经 SOCKS5 测连通，不通则刷 IP 等 5 秒再测
@@ -1540,8 +1837,11 @@ class WorkerEngine:
             self.log(f"{worker_id} 登录循环前锁定竖屏警告: {exc}")
 
         while not self._stop.is_set():
+            if not self._acquire_adb_workflow_slot(worker_id, vmindex):
+                break
             acc = self.store.claim_next(worker_id, vm_index=vmindex, profile=profile_name)
             if acc is None:
+                self._release_adb_workflow_slot(worker_id, vmindex)
                 self.log(f"{worker_id} 无更多账号，线程退出")
                 break
             self.log(f"{worker_id} 领取账号 line={acc.line_no} a1={acc.account1}")
@@ -1756,6 +2056,7 @@ class WorkerEngine:
                         adb.release_ui_control(home=False)
                     except Exception:
                         pass
+                self._release_adb_workflow_slot(worker_id, vmindex)
             if self._stop.wait(1.0):
                 break
 

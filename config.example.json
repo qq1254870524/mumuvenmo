@@ -3,6 +3,11 @@
   "mumu_manager": "C:\\Program Files\\Netease\\MuMuPlayer\\nx_main\\MuMuManager.exe",
   "adb_path": "C:\\Program Files\\Netease\\MuMuPlayer\\nx_main\\adb.exe",
   "workers": 6,
+  "max_active_vms": 8,
+  "adb_workflow_limit": 6,
+  "startup_wave_size": 1,
+  "startup_wave_settle_seconds": 8,
+  "allow_proxy_reuse": true,
   "create_count": 6,
   "create_launch_workers": 6,
   "use_nekobox": true,
@@ -50,5 +55,6 @@
   },
   "export_dir": "",
   "consecutive_risk_nonet_limit": 5,
-  "stop_force_join_timeout_seconds": 8
+  "stop_force_join_timeout_seconds": 8,
+  "adb_command_limit": 2
 }

@@ -1,3 +1,4 @@
+# 2026-08-11 cancellable-install-v1: Aurora/Venmo 全部等待可被强停打断，杜绝关机后继续刷 ADB 日志
 # 2026-07-31 play-sign-in-bail-v1: Aurora 误进 Play 登录页立即退出，禁止空转 420s 挡住 Magisk 后半段
 # -*- coding: utf-8 -*-
 """Venmo 安装：禁止单包 base.apk，优先完整 split install-multiple，其次 Aurora Store。
@@ -30,6 +31,39 @@ from paths import APK_DIR
 
 OptionalLog = Optional[Callable[[str], None]]
 
+
+class VenmoInstallCancelled(BaseException):
+    """安装/商店流程收到任务取消；BaseException 可穿透业务层 except Exception。"""
+
+
+def _cancel_requested(adb) -> bool:
+    try:
+        fn = getattr(adb, "cancel_requested", None)
+        if callable(fn):
+            return bool(fn())
+        fn = getattr(adb, "_cancel_requested", None)
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
+def _raise_if_cancelled(adb, where: str = "") -> None:
+    if _cancel_requested(adb):
+        raise VenmoInstallCancelled(
+            f"venmo_install_cancelled:{where}" if where else "venmo_install_cancelled"
+        )
+
+
+def _sleep(adb, seconds: float) -> None:
+    """最多 0.1 秒响应一次取消，替代安装流程中不可中断的 time.sleep。"""
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        _raise_if_cancelled(adb, "sleep")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
+
 VENMO_PKG = "com.venmo"
 AURORA_PKG = "com.aurora.store"
 AURORA_APK = APK_DIR / "AuroraStore-4.8.3.apk"
@@ -61,6 +95,7 @@ def bundle_files() -> list[Path]:
 
 def venmo_split_info(adb) -> dict:
     """返回 installed / paths / has_base / split_count / complete。"""
+    _raise_if_cancelled(adb, "venmo_split_info")
     out = adb.shell("pm", "path", VENMO_PKG, timeout=20) or ""
     paths = []
     for line in out.splitlines():
@@ -82,6 +117,7 @@ def venmo_split_info(adb) -> dict:
 
 
 def uninstall_venmo(adb, log: OptionalLog = None) -> str:
+    _raise_if_cancelled(adb, "uninstall_venmo")
     _log(log, "uninstall incomplete com.venmo")
     try:
         msg = adb.shell("pm", "uninstall", VENMO_PKG, timeout=60) or ""
@@ -92,6 +128,7 @@ def uninstall_venmo(adb, log: OptionalLog = None) -> str:
 
 
 def install_venmo_bundle(adb, log: OptionalLog = None) -> dict:
+    _raise_if_cancelled(adb, "install_venmo_bundle")
     files = bundle_files()
     if len(files) < 3:
         return {"ok": False, "method": "bundle", "msg": f"bundle incomplete count={len(files)}"}
@@ -112,6 +149,7 @@ def install_venmo_bundle(adb, log: OptionalLog = None) -> dict:
 
 
 def ensure_aurora(adb, log: OptionalLog = None) -> bool:
+    _raise_if_cancelled(adb, "ensure_aurora")
     if adb.package_installed(AURORA_PKG):
         _log(log, "Aurora Store already installed")
         return True
@@ -125,6 +163,7 @@ def ensure_aurora(adb, log: OptionalLog = None) -> bool:
 
 
 def _dump_xml(adb) -> str:
+    _raise_if_cancelled(adb, "dump_xml")
     try:
         return adb.uiautomator_dump(force=True) or ""
     except Exception:
@@ -132,6 +171,7 @@ def _dump_xml(adb) -> str:
 
 
 def _dump_text(adb) -> str:
+    _raise_if_cancelled(adb, "dump_text")
     try:
         return (adb.ui_full_text() or "").lower()
     except Exception:
@@ -205,7 +245,7 @@ def _enable_right_switch(adb, xml: str = "") -> str:
         if checked:
             return "already_on"
         adb.tap_bounds(b)
-        time.sleep(0.5)
+        _sleep(adb, 0.5)
         return "toggled_on"
     # 有些页 Switch 写成 Checkable Image/View，点右侧区域
     m = re.search(
@@ -243,7 +283,7 @@ def _handle_settings_permission_pages(adb, log: OptionalLog = None, rounds: int 
             notes.append(f"applinks_back{i}")
             _log(log, f"app links page -> BACK ui={low[:80]!r}")
             adb.shell("input", "keyevent", "4", timeout=5)
-            time.sleep(0.7)
+            _sleep(adb, 0.7)
             continue
         # 必须：All files / Unknown apps
         if any(k in low for k in (
@@ -259,25 +299,25 @@ def _handle_settings_permission_pages(adb, log: OptionalLog = None, rounds: int 
             r = _enable_right_switch(adb, xml)
             notes.append(f"sw{i}:{r}")
             _log(log, f"settings page switch -> {r} ui={low[:80]!r}")
-            time.sleep(0.7)
+            _sleep(adb, 0.7)
             xml2 = _dump_xml(adb)
             for lab in ("Allow", "ALLOW", "OK", "允许", "确定"):
                 if _tap_exact_text(adb, lab, xml=xml2):
                     notes.append(f"confirm:{lab}")
-                    time.sleep(0.5)
+                    _sleep(adb, 0.5)
                     break
             adb.shell("input", "keyevent", "4", timeout=5)
-            time.sleep(0.7)
+            _sleep(adb, 0.7)
             continue
         # 其它系统设置页：尝试开开关，否则 BACK
         if "settings" in low or "android" in low:
             r = _enable_right_switch(adb, xml)
             if r != "no_switch":
                 notes.append(f"misc_sw{i}:{r}")
-                time.sleep(0.5)
+                _sleep(adb, 0.5)
             notes.append(f"misc_back{i}")
             adb.shell("input", "keyevent", "4", timeout=5)
-            time.sleep(0.7)
+            _sleep(adb, 0.7)
             continue
         break
     return ",".join(notes) if notes else "none"
@@ -296,13 +336,13 @@ def _grant_unknown_sources(adb, log: OptionalLog = None) -> str:
             f"package:{AURORA_PKG}",
             timeout=15,
         )
-        time.sleep(1.2)
+        _sleep(adb, 1.2)
         notes.append(_handle_settings_permission_pages(adb, log=log, rounds=3))
         # 再确保开关
         xml = _dump_xml(adb)
         r = _enable_right_switch(adb, xml)
         notes.append(r)
-        time.sleep(0.5)
+        _sleep(adb, 0.5)
         adb.shell("input", "keyevent", "4", timeout=5)
     except Exception as e:
         notes.append(f"err:{e}")
@@ -360,6 +400,7 @@ def setup_aurora_anonymous(adb, log: OptionalLog = None, max_steps: int = 28) ->
     Permissions: 前三项 Grant(Installer / External storage / Background downloads) -> Finish；App links 不点
     账号页: 点 Anonymous（不要 Google）
     """
+    _raise_if_cancelled(adb, "setup_aurora_anonymous")
     notes: list[str] = []
     anonymous_done = False
     for step in range(max_steps):
@@ -379,7 +420,7 @@ def setup_aurora_anonymous(adb, log: OptionalLog = None, max_steps: int = 28) ->
             if hit:
                 notes.append(f"anon:{hit}")
                 anonymous_done = True
-                time.sleep(2.2)
+                _sleep(adb, 2.2)
                 continue
 
         # 系统设置页
@@ -400,7 +441,7 @@ def setup_aurora_anonymous(adb, log: OptionalLog = None, max_steps: int = 28) ->
         ):
             r = _handle_settings_permission_pages(adb, log=log, rounds=4)
             notes.append("settings:" + r)
-            time.sleep(0.8)
+            _sleep(adb, 0.8)
             continue
 
         # 权限页：前三项 Grant 完直接 Finish；App links 永远不点
@@ -441,7 +482,7 @@ def setup_aurora_anonymous(adb, log: OptionalLog = None, max_steps: int = 28) ->
                 if _label_still_needs_grant(keys):
                     if _tap_grant_near_label(adb, keys, xml):
                         notes.append(f"grant:{tag}")
-                        time.sleep(1.5)
+                        _sleep(adb, 1.5)
                         r = _handle_settings_permission_pages(adb, log=log, rounds=4)
                         if r != "none":
                             notes.append(r)
@@ -464,19 +505,19 @@ def setup_aurora_anonymous(adb, log: OptionalLog = None, max_steps: int = 28) ->
                                 continue
                             if _tap_exact_text(adb, lab, xml=xml3):
                                 notes.append(f"sys:{lab}")
-                                time.sleep(0.8)
+                                _sleep(adb, 0.8)
                                 break
                         break  # 每轮只处理一项
             else:
                 # 前三项都没有待点 Grant -> Finish（忽略 App links）
                 if _tap_exact_text(adb, "Finish", xml=xml) or _tap_exact_text(adb, "FINISH", xml=xml) or _tap_exact_text(adb, "完成", xml=xml):
                     notes.append("finish")
-                    time.sleep(1.8)
+                    _sleep(adb, 1.8)
                 else:
                     # Finish 可能因 required 未完成灰掉，再兜底 Grant 非 App links
                     if _tap_grant_near_label(adb, ["Installer permission", "External storage", "Background downloads"], xml):
                         notes.append("grant:retry_non_applinks")
-                        time.sleep(1.5)
+                        _sleep(adb, 1.5)
                         _handle_settings_permission_pages(adb, log=log, rounds=4)
                     else:
                         notes.append("finish_miss")
@@ -487,7 +528,7 @@ def setup_aurora_anonymous(adb, log: OptionalLog = None, max_steps: int = 28) ->
             hit = _tap_first_exact(adb, ["Next", "Skip", "下一步", "跳过"], xml)
             if hit:
                 notes.append(hit)
-                time.sleep(1.2)
+                _sleep(adb, 1.2)
                 continue
 
         # 账号选择页可能用 Google / Anonymous 卡片
@@ -495,7 +536,7 @@ def setup_aurora_anonymous(adb, log: OptionalLog = None, max_steps: int = 28) ->
             if _tap_first_exact(adb, ["Anonymous", "匿名"], xml):
                 anonymous_done = True
                 notes.append("anon:account_page")
-                time.sleep(2.0)
+                _sleep(adb, 2.0)
                 continue
             notes.append("account_page_no_anon")
 
@@ -519,14 +560,14 @@ def setup_aurora_anonymous(adb, log: OptionalLog = None, max_steps: int = 28) ->
         )
         if hit:
             notes.append(hit)
-            time.sleep(1.2)
+            _sleep(adb, 1.2)
             continue
 
         if "session installer" in low or "native installer" in low:
             hit = _tap_first_exact(adb, ["Session Installer", "Save", "保存", "Apply", "Done", "OK"], xml)
             if hit:
                 notes.append(hit)
-                time.sleep(1.0)
+                _sleep(adb, 1.0)
                 continue
 
         notes.append(f"stuck:{low[:40]}")
@@ -537,7 +578,7 @@ def setup_aurora_anonymous(adb, log: OptionalLog = None, max_steps: int = 28) ->
         if _tap_first_exact(adb, ["Anonymous", "匿名"], xml):
             anonymous_done = True
             notes.append("anon:late")
-            time.sleep(2.0)
+        _sleep(adb, 2.0)
 
     low = _dump_text(adb)
     if anonymous_done and any(k in low for k in ("for you", "apps", "search", "updates", "library")):
@@ -562,6 +603,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
     4) market://details?id=com.venmo 或搜索 Venmo
     5) Install/Update，等完整 split
     """
+    _raise_if_cancelled(adb, "open_aurora_for_venmo")
     ensure_aurora(adb, log=log)
     notes: list[str] = []
     try:
@@ -606,7 +648,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
             h = _tap_first_exact(adb, ["Anonymous", "匿名"], xml)
             if h:
                 hits.append(h)
-                time.sleep(1.0)
+                _sleep(adb, 1.0)
                 xml = _dump_xml(adb)
                 texts = [t.strip() for t in re.findall(r'text="([^"]+)"', xml) if t and t.strip()]
                 low = " ".join(texts).lower()
@@ -617,7 +659,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
             h = _tap_first_exact(adb, ["INSTALL", "Install", "安装"], xml)
             if h:
                 hits.append("sys:" + h)
-                time.sleep(1.2)
+                _sleep(adb, 1.2)
                 return ",".join(hits)
         # 下载/安装进行中不要点 Open
         busy = any(x in low for x in (
@@ -650,7 +692,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
                 h = _tap_first_exact(adb, [lab], xml)
                 if h:
                     hits.append(h)
-                    time.sleep(0.8)
+                    _sleep(adb, 0.8)
                     xml = _dump_xml(adb)
                     texts = [t.strip() for t in re.findall(r'text="([^"]+)"', xml) if t and t.strip()]
                     low = " ".join(texts).lower()
@@ -659,13 +701,13 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
             h = _tap_first_exact(adb, ["Open", "打开"], xml)
             if h:
                 hits.append(h)
-                time.sleep(0.7)
+                _sleep(adb, 0.7)
         # 系统权限 Allow 仅当不像 Aurora 权限介绍页
         if ("allow" in low) and ("installer permission" not in low) and ("allow installing apps from aurora" not in low):
             h = _tap_first_exact(adb, ["Allow", "ALLOW", "允许"], xml)
             if h:
                 hits.append(h)
-                time.sleep(0.7)
+                _sleep(adb, 0.7)
         return ",".join(hits)
 
     # 打开 Aurora
@@ -676,7 +718,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
     try:
         adb.shell("monkey", "-p", AURORA_PKG, "-c", "android.intent.category.LAUNCHER", "1", timeout=20)
         notes.append("launch")
-        time.sleep(2.5)
+        _sleep(adb, 2.5)
     except Exception as e:
         notes.append(f"launch_err:{e}")
 
@@ -687,7 +729,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
         notes.append("unknown:" + _grant_unknown_sources(adb, log=log))
         # 回到 Aurora
         adb.shell("monkey", "-p", AURORA_PKG, "-c", "android.intent.category.LAUNCHER", "1", timeout=20)
-        time.sleep(1.5)
+        _sleep(adb, 1.5)
         setup2 = setup_aurora_anonymous(adb, log=log, max_steps=8)
         notes.append("re:" + setup2)
     except Exception as e:
@@ -701,7 +743,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
         try:
             adb.shell(*args, timeout=15)
             notes.append("intent:" + args[-2][:30])
-            time.sleep(2.2)
+            _sleep(adb, 2.2)
             dismiss_runtime()
             ui = _dump_text(adb)
             if "venmo" in ui or "install" in ui or "update" in ui:
@@ -715,7 +757,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
         for lab in ("Search", "搜索", "Search apps"):
             if tap_labels([lab]):
                 notes.append("tap_search")
-                time.sleep(0.8)
+                _sleep(adb, 0.8)
                 break
         try:
             # 清空并输入
@@ -723,7 +765,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
             adb.shell("input", "text", "Venmo", timeout=10)
             adb.shell("input", "keyevent", "66", timeout=8)
             notes.append("typed_venmo")
-            time.sleep(2.0)
+            _sleep(adb, 2.0)
         except Exception as e:
             notes.append(f"type_err:{e}")
         try:
@@ -731,7 +773,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
             if b:
                 adb.tap_bounds(b)
                 notes.append("tap_result_venmo")
-                time.sleep(2.0)
+                _sleep(adb, 2.0)
         except Exception:
             pass
 
@@ -768,12 +810,12 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
             if play_signin_hits >= 2:
                 _log(log, "Aurora path hit Play Store sign-in -> bail (not blocking Magisk)")
                 break
-            time.sleep(0.8)
+            _sleep(adb, 0.8)
             continue
         if "anonymous" in ui or "匿名" in ui:
             if _tap_first_exact(adb, ["Anonymous", "匿名"]):
                 notes.append("anon_again")
-                time.sleep(1.5)
+                _sleep(adb, 1.5)
                 continue
 
         # 系统安装确认弹窗优先
@@ -781,7 +823,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
             h = _tap_first_exact(adb, ["INSTALL", "Install", "安装"])
             if h:
                 notes.append("sys_install:" + h)
-                time.sleep(2.0)
+                _sleep(adb, 2.0)
                 continue
 
         if any(x in ui for x in (
@@ -789,7 +831,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
             "queued", "pending", "percent", "%", "preparing",
         )):
             notes.append("progress")
-            time.sleep(4.0)
+            _sleep(adb, 4.0)
             continue
 
         hit = tap_labels(
@@ -808,7 +850,7 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
         if hit:
             last_tap = hit
             notes.append(f"tap:{hit}")
-            time.sleep(2.5)
+            _sleep(adb, 2.5)
             dismiss_runtime()
             continue
 
@@ -820,10 +862,10 @@ def open_aurora_for_venmo(adb, log: OptionalLog = None) -> str:
             if b:
                 adb.tap_bounds(b)
                 notes.append(f"bounds:{key}")
-                time.sleep(2.0)
+                _sleep(adb, 2.0)
                 break
         else:
-            time.sleep(3.0)
+            _sleep(adb, 3.0)
 
     info = venmo_split_info(adb)
     _log(log, f"Aurora wait end complete={info.get('complete')} splits={info.get('split_count')} last={last_tap}")
@@ -840,6 +882,7 @@ def ensure_venmo_ready(adb, log: OptionalLog = None, prefer_aurora: bool = False
     prefer_aurora=True 时优先走 Aurora 匿名安装；否则优先本地 venmo_bundle install-multiple。
     禁止安装单 base.apk。
     """
+    _raise_if_cancelled(adb, "ensure_venmo_ready")
     info = venmo_split_info(adb)
     if info.get("complete"):
         _log(log, f"Venmo complete already splits={info.get('split_count')}")

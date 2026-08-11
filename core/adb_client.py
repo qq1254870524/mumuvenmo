@@ -1,3 +1,6 @@
+# 2026-08-12 adb-broker-fast8-v1: Worker/模拟器不设运行上限；只对共享 adb 子进程做可配置背压
+# 2026-08-12 adb-fourway-queue-v1: ADB 全局并发固定 4；8 Worker 只排队，不再压垮共享 server/package 服务
+# 2026-08-11 adb-sixway-v1: 普通 ADB 全局并发 10→6，避免 8 个 worker+辅助线程压垮共享 adb server
 # 2026-07-31 install-heal-fast-v3: pure TIMEOUT/package-dead 不再空重试，立刻返回促 MuMu heal
 # 2026-07-31 instant-stop-v2: cancel 轮询保持可重入
 # 2026-07-31 package-installed-hangfix-v4: pm 连续超时快速失败+service check；install 首超 120s 促 heal
@@ -24,6 +27,7 @@ from __future__ import annotations
 # 2026-07-31 install-timeout-retry-v1: install TIMEOUT/offline 重连再试；package_installed 严格匹配
 # 2026-07-31 heavy-install-v1: install/push 全局限3; 可中断Popen; package_installed加固
 # 2026-07-31 zombie-cancel-v1+adb-pressure: global=6 heavy=4; interruptible acquire; offline retry
+# 2026-08-11 cancel-before-log-v1: 取消状态先于 DEBUG 记录返回，停止后不再产生 ADB 尾日志
 # 2026-07-31 immediate-stop-v1: request_cancel_all/interrupt_all 杀活动adb
 
 import logging
@@ -53,8 +57,14 @@ class AdbClient:
     # 同类串口互斥，避免同 VM 主线程 + su-grant 双路 uiautomator 互抢
     _serial_locks: dict[str, "threading.RLock"] = {}
     _serial_locks_guard = threading.Lock()
-    # 全局 ADB 并发：单实例下 10 台可并行；12 易 thrash
-    _global_adb_sema = threading.Semaphore(10)
+    # MuMu 的多个 TCP serial 仍共享同一个 adb server。实跑确认 4 台正常，而
+    # 8 台同时做 pm path/service check 会让 Android package 服务连续 8s 超时。
+    # 全局只放行 4 条 ADB 命令，其余线程排队；配合 Worker 4+4 启动波次。
+    # 8台多开时避免 adb server/client 进程与 Android package service 请求风暴。
+    # 单条命令只放2路；上层 Worker 还会把整套登录工作流限制为3路。
+    _global_adb_limit = 2
+    _global_adb_sema = threading.Semaphore(_global_adb_limit)
+    _global_adb_config_guard = threading.Lock()
     # 重操作(install/push) 全局限流：6 路同步装包
     _heavy_adb_sema = threading.Semaphore(6)
     _cancel_all = threading.Event()
@@ -62,6 +72,33 @@ class AdbClient:
     _active_procs = {}
     _instance_cancel_checks_guard = threading.Lock()
     _instance_cancel_checks = {}
+
+    @classmethod
+    def configure_global_limit(cls, limit: int) -> int:
+        """在一轮任务启动前重建共享 ADB 命令闸门。
+
+        这只限制同时运行的 adb.exe 数量，不限制 Worker、账号、模拟器或登录
+        流程数量。WorkerEngine 会在创建任何 Worker 线程前调用本方法。
+        """
+        value = min(4, max(1, int(limit or 2)))
+        with cls._global_adb_config_guard:
+            with cls._active_procs_guard:
+                if cls._active_procs:
+                    logger.warning(
+                        "ADB broker busy; keep limit=%s requested=%s active=%s",
+                        cls._global_adb_limit,
+                        value,
+                        len(cls._active_procs),
+                    )
+                    return int(cls._global_adb_limit)
+            cls._global_adb_limit = value
+            cls._global_adb_sema = threading.Semaphore(value)
+        logger.info("ADB command broker limit=%s (workers/emulators unlimited)", value)
+        return value
+
+    @classmethod
+    def global_limit(cls) -> int:
+        return int(cls._global_adb_limit)
 
     @classmethod
     def request_cancel_all(cls):
@@ -182,6 +219,10 @@ class AdbClient:
             pass
         return False
 
+    def cancel_requested(self) -> bool:
+        """公开只读取消状态，供安装/UI 等长流程实现可中断等待。"""
+        return bool(self._cancel_requested())
+
     def _is_heavy_args(self, args):
         if not args:
             return False
@@ -210,9 +251,9 @@ class AdbClient:
 
     def _run(self, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
         cmd = [str(self.adb), "-s", self.serial, *args]
-        logger.debug("ADB: %s", " ".join(cmd))
         if self._cancel_requested():
             return subprocess.CompletedProcess(cmd, 130, "", "adb_cancelled")
+        logger.debug("ADB: %s", " ".join(cmd))
         flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
         heavy = self._is_heavy_args(args)
         heavy_got = False
@@ -1777,12 +1818,6 @@ wm size 2>/dev/null || true
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int, ms: int = 300) -> str:
         return self.shell("input", "swipe", str(x1), str(y1), str(x2), str(y2), str(ms), timeout=20)
-
-    def screencap(self, local_path: str | Path) -> bool:
-        remote = "/sdcard/mumuvenmo_cap.png"
-        self.shell("screencap", "-p", remote, timeout=30)
-        self.pull(remote, local_path)
-        return Path(local_path).exists()
 
     def ui_dump_xml(self) -> str:
         return self.uiautomator_dump()

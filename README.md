@@ -1,35 +1,17 @@
 # mumuvenmo
 
-MuMu 多开 + Venmo 装包/登录自动化（本地工具）。
+MuMu 多开 + Venmo 装包/登录 GUI 自动化工具。
 
-## 2026-08-11 更新摘要
+## 2026-08-12 正式版
 
-- GUI SOCKS5 代理池改为每行 `代理|刷新链接`，支持 `+` 新增、`-` 删除并持久化
-- 每个 Worker 启动前独立检测绑定代理；不通时刷新一次，等待 10 秒后最多复测 5 轮
-- 同一刷新链接固定 180 秒冷却；健康代理对应的线程立即启动，不等待慢代理
-- 多选模拟器保持独立并发：首次缺包的 VM 会先自愈安装，完成后自动进入登录循环
-- 模拟器窗口固定从左上角按 360x640 紧凑一行排列；数量过多时只缩小，不再放大占满屏幕
-- 日志文件遇到占用/权限问题时自动切换到进程专用日志，不再阻止 GUI 启动
-- 停止登录后，当前登录调用栈会在约 0.1 秒内收到取消；只有 `workers=0` 才显示停止完成，模拟器关闭后不再持续刷 ADB 尾日志
-- 强停取消的账号会退回待处理，新任务会自动清理上一轮 ADB 取消标记
+- 勾选多少台模拟器，就为多少台创建独立登录 Worker；先就绪的模拟器立即开始。
+- `adb_command_limit` 只限制同时执行的 ADB 子进程，不限制多开数量或登录线程数量。
+- 运行期 PNG 截图、`adb screencap` 和图片 `pull` 已删除；保留登录控件定位与结果识别必需的 UI XML dump。
+- SOCKS5 使用 `proxy|refresh_url` 单行格式，GUI 可通过 `+`/`-` 动态增删。
+- 代理启动前多轮测网；不通时遵守 180 秒刷新冷却，刷新后等待并复测；日志记录 VM、Worker 和代理编号。
+- 实机验证 11 个 Worker、VM0–VM10、11/11 ADB device 持续并发运行，无 ADB timeout、卡死或 GUI 未响应。
 
-代理行示例：
-
-```text
-host:port:user:pass|https://example.com/change-ip/TOKEN
-```
-
-完整说明见 [docs/UPDATE_2026-08-11.md](docs/UPDATE_2026-08-11.md)。
-
-## 2026-07-31 更新摘要
-
-- 多开同步装包：新建 N 台可 N 台并行走完后半段（不再只剩 3~4 台）
-- 装包卡死自愈：adb install 超时后 MuMu restart 再装，E2E 实测 6/6
-- Magisk Direct Install 掉桌面可软恢复
-- 【停止任务】/【停止登录】秒级取消（instant-stop-v2，约 0.1s）
-- **不改变**原有业务装包流程
-
-完整说明见 [CHANGELOG.md](CHANGELOG.md) 与 [docs/UPDATE_2026-07-31.md](docs/UPDATE_2026-07-31.md)。
+完整更新见 [CHANGELOG.md](CHANGELOG.md) 与 [docs/UPDATE_2026-08-12.md](docs/UPDATE_2026-08-12.md)。
 
 ## 快速开始
 
@@ -38,37 +20,38 @@ cd mumuvenmo
 copy config.example.json config.json
 copy proxies\cocks5.txt.example proxies\cocks5.txt
 copy accounts\input\accounts.example.txt accounts\input\import_active.txt
-```
-
-1. 小型 APK（NekoBox / Kitsune / Aurora / Venmo splits）已随仓库提供；仅需自行放入 `assets/apk/venmo_bundle/base.apk`（约 161MB，超 GitHub 单文件限制）
-2. 在 GUI 代理池逐行填写 `代理|刷新链接`，或编辑 `proxies\cocks5.txt`
-3. 编辑 `accounts\input\import_active.txt` 写入账号
-4. 启动：
-
-```bat
 start.cmd
 ```
 
-或：
+发布包已包含 NekoBox、Kitsune、Aurora、Venmo split APK 和 ih8 模块；`assets/apk/venmo_bundle/base.apk` 约 161MB，需自行放入（GitHub 单文件大小限制）。
 
-```bat
-python -B main.py
+## SOCKS5 代理格式
+
+每行一套代理和刷新链接：
+
+```text
+HOST:PORT:USERNAME:PASSWORD|https://refresh.example/action
 ```
 
-## 推荐并行参数
+GUI 中点 `+` 新增一行，新增行点 `-` 删除。刷新链接可留空；同一链接默认 180 秒最多刷新一次。
 
-为了「新建几台就几台同时装包」，建议：
+## 并发配置
 
 ```json
 {
-  "create_count": 6,
-  "create_launch_workers": 6,
-  "workers": 6,
-  "stop_force_join_timeout_seconds": 8
+  "workers": 11,
+  "adb_workflow_limit": 11,
+  "adb_command_limit": 4,
+  "startup_wave_size": 1,
+  "startup_wave_settle_seconds": 8,
+  "allow_proxy_reuse": true
 }
 ```
 
-`create_launch_workers` 应 **>= create_count**，否则会串行排队，看起来像只有 3~4 台在动。
+- `workers`：登录线程数。
+- `adb_workflow_limit`：兼容字段，GUI 会与 `workers` 对齐。
+- `adb_command_limit`：同时执行的 ADB 命令数，范围 1–4；它不是模拟器数量上限。
+- `allow_proxy_reuse`：代理少于 Worker 时允许自动均衡复用。
 
 ## 账号格式
 
@@ -77,33 +60,31 @@ python -B main.py
 账号1----密码----账号2----残号----姓名
 ```
 
-导出分类（默认 `export/classified/`）：
+四类实时导出位于 `export/classified/`：
 
-- correct.txt
-- wrong_password.txt
-- locked.txt
-- captcha_or_review.txt
-- residual.txt
-- other_fail.txt
+- `correct.txt`
+- `risk_control.txt`
+- `wrong_password.txt`
+- `no_network.txt`
 
-## 目录结构（摘要）
+处理完成后，账号从输入源原子移出并写入对应结果文件；输入剩余数与四类结果累计数保持守恒。
+
+## 目录结构
 
 - `app_ui.py` / `main.py`：GUI 与入口
-- `core/`：MuMu / ADB / 装包 / Magisk / 登录 / worker
-- `assets/apk/`：小型 APK 与模块（`base.apk` 需自备）
-- `config.example.json`：配置模板（本地复制为 `config.json`）
-- `proxies/cocks5.txt.example`：代理模板
-- `accounts/input/accounts.example.txt`：账号模板
+- `core/`：MuMu、ADB、代理、装包、登录与 Worker
+- `assets/`：小型 APK、Venmo splits 与模块
+- `config.example.json`：无真实数据的配置模板
+- `proxies/cocks5.txt.example`：代理格式模板
+- `accounts/input/accounts.example.txt`：账号格式模板
 
-## 安全与仓库约定
+## 发布包排除项
 
-**禁止提交：**
-
-- 真实 `config.json`
-- 真实账号文件
-- 真实代理凭据
-- 日志 / 导出结果 / state
-- `assets/apk/venmo_bundle/base.apk`（过大）
+- `config.json`
+- 真实账号与真实代理
+- 日志、导出结果、运行状态
+- `__pycache__`、`.pyc`、临时文件
+- `assets/apk/venmo_bundle/base.apk`
 
 ## License
 

@@ -18,6 +18,7 @@
   * change-ip HTTP 400 短退避重试；失败写短暂 cooldown，避免同 profile 并发打爆
 - 2026-07-25 refresh-error-netcheck-v1: change_ip_error 后仍主机测 SOCKS5，通则可继续
 - 2026-07-25 reassign-atomic-v2: reassign 返回前断言 change_ip_url 与 profile_name 成套
+- 2026-08-12 proxy-number-log-v1: 按 GUI 行顺序提供稳定的代理编号，供日志明确记录每台模拟器使用代理几
 """
 from __future__ import annotations
 
@@ -425,6 +426,7 @@ def check_device_network(adb, timeout: int = 12) -> bool:
     return False
 
 
+# 2026-08-12 proxy-reuse-autoassign-v1: 代理少于 Worker 时自动均衡复用
 class ProxyPool:
     def __init__(
         self,
@@ -437,7 +439,9 @@ class ProxyPool:
         self.proxies = list(proxies or [])
         self._rr = 0
         self._assigned: dict[str, ProxyProfile] = {}  # worker_key -> proxy
-        self.allow_reuse = True  # 线程超过代理数时允许复用
+        # 代理数少于 Worker 时允许自动复用；分配器先用空闲代理，再按
+        # round-robin 均衡复用。每条代理自己的刷新冷却仍由代理池统一控制。
+        self.allow_reuse = True
         self.min_refresh_interval_seconds = float(min_refresh_interval_seconds)
         self.refresh_wait_seconds = float(refresh_wait_seconds)
         self.persist_refresh_state = bool(persist_refresh_state)
@@ -558,6 +562,29 @@ class ProxyPool:
         with self._lock:
             return [p.profile_name for p in self.proxies]
 
+    def number_of(self, profile: ProxyProfile | str | None) -> int:
+        """返回代理在 GUI/配置文件中的 1 基编号；未知代理返回 0。
+
+        优先按对象身份定位，随后按稳定 ``profile_name`` 定位。这样运行中
+        ``assign/reassign/rebind`` 都能打印用户看到的“代理#1、代理#2”。
+        """
+        if profile is None:
+            return 0
+        with self._lock:
+            for number, candidate in enumerate(self.proxies, 1):
+                if candidate is profile:
+                    return number
+            name = (
+                str(profile)
+                if isinstance(profile, str)
+                else str(getattr(profile, "profile_name", "") or "")
+            )
+            if name:
+                for number, candidate in enumerate(self.proxies, 1):
+                    if str(candidate.profile_name or "") == name:
+                        return number
+        return 0
+
     def stats(self) -> dict:
         with self._lock:
             now = time.time()
@@ -583,7 +610,7 @@ class ProxyPool:
         策略：
         1. 已分配则复用同一绑定
         2. 优先 ref_count==0 的空闲代理
-        3. 无空闲且 allow_reuse=True 时，按 round-robin 复用（线程>代理数）
+        3. allow_reuse 开启时按 round-robin 均衡复用
         """
         with self._lock:
             if worker_key in self._assigned:

@@ -12,7 +12,7 @@
 - mask-timeout-retry-v2: 识别验证页/掩码；禁止验证页打勾resubmit；超时重登直到出结果
 - 适配欢迎页 welcome_login_button 再进表单
 - 用真实 resource-id 定位邮箱/密码/登录按钮
-- 每步日志 + 超时截图/UI dump
+- 每步日志 + 仅文本 UI dump（运行时禁止截图/拉取 PNG，避免占满 ADB）
 - 特殊字符密码安全输入
 - step3: 登录前 force-stop Kitsune/Magisk（绝不停 NekoBox）；识别 Magisk UI 抢前台并重拉 Venmo
 - step3fix: uiautomator null root 不 HOME；启动后按 focus/空 dump 重拉 Venmo
@@ -32,7 +32,7 @@ from typing import Callable, Optional
 
 from core.account_store import LoginResult, classify_ui_text
 from core.adb_client import AdbClient
-from paths import LOG_TEST_DIR, SCREENSHOTS_DIR
+from paths import LOG_TEST_DIR
 
 logger = logging.getLogger("mumuvenmo")
 OptionalLog = Optional[Callable[[str], None]]
@@ -115,20 +115,16 @@ class VenmoLogin:
             except Exception:
                 pass
 
-    def _save_debug(self, tag: str) -> str:
+    def _save_debug_xml(self, tag: str) -> str:
+        """只保存 UI 层级文本；运行时不生成、拉取或保存任何截图。"""
         ts = time.strftime("%Y%m%d_%H%M%S")
         xml_path = LOG_TEST_DIR / f"ui_{tag}_{ts}.xml"
-        png_path = SCREENSHOTS_DIR / f"{tag}_{ts}.png"
         try:
             xml = self.adb.uiautomator_dump() or ""
             xml_path.write_text(xml, encoding="utf-8")
         except Exception as e:
             self._log(f"save xml fail: {e}")
             xml = ""
-        try:
-            self.adb.screencap(png_path)
-        except Exception as e:
-            self._log(f"screencap fail: {e}")
         return xml
 
     def _force_stop_blockers(self) -> None:
@@ -833,7 +829,7 @@ class VenmoLogin:
             except Exception as e:
                 self._log(f"restart after form miss: {e}")
             self._sleep(2.5)
-        self._save_debug("no_login_form")
+        self._save_debug_xml("no_login_form")
         return False
 
     def _fill_credentials(self, account: str, password: str) -> bool:
@@ -848,7 +844,7 @@ class VenmoLogin:
             email_b = self.adb.find_node_bounds(class_endswith="EditText", password=False, xml=xml)
         if not email_b:
             self._log("email field not found")
-            self._save_debug("no_email_field")
+            self._save_debug_xml("no_email_field")
             return False
 
         self._log("fill email")
@@ -890,7 +886,7 @@ class VenmoLogin:
             self._sleep(0.7)
         if not pw_b:
             self._log("password field not found")
-            self._save_debug("no_password_field")
+            self._save_debug_xml("no_password_field")
             return False
 
         self._log("fill password")
@@ -1163,7 +1159,7 @@ class VenmoLogin:
         self.clear_and_start()
         filled = self._fill_credentials(account, password)
         if not filled:
-            xml = self._save_debug("fill_failed")
+            xml = self._save_debug_xml("fill_failed")
             self._release_ui()
             return LoginOutcome(
                 result=LoginResult.ERROR,
@@ -1188,7 +1184,7 @@ class VenmoLogin:
             self._log(
                 "识别结果(early-lock-immediate): %s phone=%s msg=%s" % (result.value, phone, msg)
             )
-            self._save_debug("result_%s" % result.value)
+            self._save_debug_xml("result_%s" % result.value)
             try:
                 self.adb.shell("am", "force-stop", self.package, timeout=10)
             except Exception:
@@ -1226,7 +1222,7 @@ class VenmoLogin:
                 % (last_ui[:160], res0.value, phone0)
             )
             if res0 == LoginResult.SUCCESS:
-                self._save_debug("result_success_immediate")
+                self._save_debug_xml("result_success_immediate")
                 self._release_ui()
                 return LoginOutcome(
                     result=LoginResult.SUCCESS,
@@ -1257,7 +1253,7 @@ class VenmoLogin:
                 self._log(
                     "识别结果(early-lock): %s phone=%s msg=%s" % (result.value, phone, msg)
                 )
-                self._save_debug("result_%s" % result.value)
+                self._save_debug_xml("result_%s" % result.value)
                 try:
                     self.adb.shell("am", "force-stop", self.package, timeout=10)
                 except Exception:
@@ -1325,7 +1321,7 @@ class VenmoLogin:
                 self._log(
                     "识别结果(early-lock): %s phone=%s msg=%s" % (result.value, phone, msg)
                 )
-                self._save_debug("result_%s" % result.value)
+                self._save_debug_xml("result_%s" % result.value)
                 self._release_ui()
                 return LoginOutcome(
                     result=result,
@@ -1340,7 +1336,7 @@ class VenmoLogin:
                 if result == LoginResult.SUCCESS and not phone:
                     phone = getattr(self, "_success_candidate_phone", "") or ""
                 self._log("识别结果: %s phone=%s msg=%s" % (result.value, phone, msg))
-                self._save_debug("result_%s" % result.value)
+                self._save_debug_xml("result_%s" % result.value)
                 self._release_ui()
                 return LoginOutcome(
                     result=result,
@@ -1371,7 +1367,7 @@ class VenmoLogin:
                     self._sleep(2.0)
                     continue
                 self._log("verification/masked page detected phone=%r" % (phone,))
-                self._save_debug("verification")
+                self._save_debug_xml("verification")
                 self._release_ui()
                 return LoginOutcome(
                     result=LoginResult.SUCCESS,
@@ -1412,7 +1408,7 @@ class VenmoLogin:
                     self._sleep(2.0)
                     continue
                 if self._welcome_bounce_count >= 2:
-                    self._save_debug("welcome_bounce")
+                    self._save_debug_xml("welcome_bounce")
                     self._release_ui()
                     return LoginOutcome(
                         result=LoginResult.ERROR,
@@ -1464,7 +1460,7 @@ class VenmoLogin:
                 "login_timeout but saw success candidate, classify SUCCESS phone=%r"
                 % (phone,)
             )
-            self._save_debug("success_timeout_fallback")
+            self._save_debug_xml("success_timeout_fallback")
             self._release_ui()
             return LoginOutcome(
                 result=LoginResult.SUCCESS,
@@ -1473,7 +1469,7 @@ class VenmoLogin:
                 used_account=account,
                 ui_snippet=last_ui[:800],
             )
-        self._save_debug("login_timeout")
+        self._save_debug_xml("login_timeout")
         self._release_ui()
         return LoginOutcome(
             result=LoginResult.ERROR,
