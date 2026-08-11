@@ -479,7 +479,7 @@ class App(tk.Tk):
 
         ttk.Label(top, text="ADB命令并发").grid(row=0, column=6, sticky=tk.W, padx=(8, 0))
         self.var_adb_workflow = tk.IntVar(value=int(self.cfg.get("adb_command_limit", 2) or 2))
-        ttk.Spinbox(top, from_=1, to=4, textvariable=self.var_adb_workflow, width=4).grid(row=0, column=7, padx=2)
+        ttk.Spinbox(top, from_=1, to=32, textvariable=self.var_adb_workflow, width=4).grid(row=0, column=7, padx=2)
 
         self.var_nekobox = tk.BooleanVar(value=bool(self.cfg.get("use_nekobox", True)))
         ttk.Checkbutton(top, text="NekoBox", variable=self.var_nekobox).grid(row=0, column=8, padx=6)
@@ -946,10 +946,10 @@ class App(tk.Tk):
         self.cfg["workers"] = int(self.var_workers.get())
         self.cfg["max_active_vms"] = 8
         self.cfg["adb_command_limit"] = min(
-            4, max(1, int(self.var_adb_workflow.get() or 2))
+            32, max(1, int(self.var_adb_workflow.get() or 2))
         )
         # 登录线程与 Worker 数量一致，不限制模拟器/账号流程数量。旧字段写成同值
-        # 仅用于兼容旧配置；拥堵由 adb_command_limit 的共享命令队列治理。
+        # 仅用于兼容旧配置；ADB命令并发可在1–32间独立设置，由共享命令队列治理。
         self.cfg["adb_workflow_limit"] = max(1, int(self.var_workers.get() or 1))
         # 全部 VM 快速错峰派发；坏代理独立复测/换绑，不再阻塞后续健康 VM。
         self.cfg["startup_wave_size"] = 1

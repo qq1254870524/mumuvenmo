@@ -57,11 +57,8 @@ class AdbClient:
     # 同类串口互斥，避免同 VM 主线程 + su-grant 双路 uiautomator 互抢
     _serial_locks: dict[str, "threading.RLock"] = {}
     _serial_locks_guard = threading.Lock()
-    # MuMu 的多个 TCP serial 仍共享同一个 adb server。实跑确认 4 台正常，而
-    # 8 台同时做 pm path/service check 会让 Android package 服务连续 8s 超时。
-    # 全局只放行 4 条 ADB 命令，其余线程排队；配合 Worker 4+4 启动波次。
-    # 8台多开时避免 adb server/client 进程与 Android package service 请求风暴。
-    # 单条命令只放2路；上层 Worker 还会把整套登录工作流限制为3路。
+    # MuMu 的多个 TCP serial 共享同一个 adb server；命令并发由 GUI 独立配置。
+    # 默认值保持保守，但不把用户配置硬截断为4；上限与登录线程控件一致为32。
     _global_adb_limit = 2
     _global_adb_sema = threading.Semaphore(_global_adb_limit)
     _global_adb_config_guard = threading.Lock()
@@ -80,7 +77,7 @@ class AdbClient:
         这只限制同时运行的 adb.exe 数量，不限制 Worker、账号、模拟器或登录
         流程数量。WorkerEngine 会在创建任何 Worker 线程前调用本方法。
         """
-        value = min(4, max(1, int(limit or 2)))
+        value = min(32, max(1, int(limit or 2)))
         with cls._global_adb_config_guard:
             with cls._active_procs_guard:
                 if cls._active_procs:

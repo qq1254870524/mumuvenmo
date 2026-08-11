@@ -50,7 +50,7 @@ GUI 中点 `+` 新增一行，新增行点 `-` 删除。刷新链接可留空；
 
 - `workers`：登录线程数。
 - `adb_workflow_limit`：兼容字段，GUI 会与 `workers` 对齐。
-- `adb_command_limit`：同时执行的 ADB 命令数，范围 1–4；它不是模拟器数量上限。
+- `adb_command_limit`：同时执行的 ADB 命令数，范围 1–32；它不是模拟器数量上限。
 - `allow_proxy_reuse`：代理少于 Worker 时允许自动均衡复用。
 
 ## 账号格式
