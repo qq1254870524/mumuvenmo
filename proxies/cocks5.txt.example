@@ -2,4 +2,5 @@
 # host:port
 # host:port:user:pass
 # socks5://user:pass@host:port
+# host:port:user:pass|https://example.com/change-ip/TOKEN
 127.0.0.1:1080

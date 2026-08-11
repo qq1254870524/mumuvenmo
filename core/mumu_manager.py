@@ -1,3 +1,4 @@
+# 2026-08-11 compact-row-v3: 一行排列只在放不下时缩小，禁止自动放大占满屏幕；修正间距方向并恢复最大化窗口
 # 2026-07-31 engine-version-v1: create 强制 --version 已装引擎(12)，60014 自动重试 auto/12
 # 2026-07-31 instant-stop-v2: launch_and_wait 支持 cancel_check 秒退
 # 2026-07-25 kitsune-cache-recreate-v1.1: 修复 DATA_STATE_DIR 局部导入 NameError； create/delete 清理 kitsune_ok_vmN.json，防索引复用误跳过
@@ -1454,6 +1455,13 @@ class MuMuManager:
             import ctypes
 
             user32 = ctypes.windll.user32
+            # 最大化/最小化状态会让 SetWindowPos 的宽高看似成功但窗口仍占满屏幕。
+            # 先恢复为普通窗口，再执行精确的一行定位。
+            try:
+                if user32.IsIconic(hwin) or user32.IsZoomed(hwin):
+                    user32.ShowWindow(hwin, 9)  # SW_RESTORE
+            except Exception:
+                pass
             flags = 0x0004 | 0x0010  # SWP_NOZORDER | SWP_NOACTIVATE
             ok = user32.SetWindowPos(hwin, 0, int(x), int(y), int(w), int(h), flags)
             t = str(title if title is not None else int(vmindex))
@@ -1496,29 +1504,32 @@ class MuMuManager:
             screen_w = screen_w or sw
             screen_h = screen_h or sh
 
-        use_auto = bool(auto_fit) or width is None or height is None
-        est_chrome_w = 8
-        est_chrome_h = 40
-        chrome_w = est_chrome_w
-        chrome_h = est_chrome_h
+        # auto_fit 的正确语义是“窗口过多时自动缩小以保持一行”，不是把少量窗口
+        # 自动放大铺满整块屏幕。未显式传宽高时以 GUI 默认 360x640 为上限。
+        use_auto = bool(auto_fit)
+        preferred_width = max(120, int(width or 360))
+        preferred_height = max(200, int(height or 640))
+        effective_margin = 0 if use_auto else max(0, int(margin))
+        if use_auto:
+            n = max(1, len(ids))
+            usable_w = max(120, int(screen_w) - int(start_x) - effective_margin * (n - 1))
+            usable_h = max(200, int(screen_h) - int(start_y))
+            max_cell_w = max(120, usable_w // n)
+            scale = min(
+                1.0,
+                float(max_cell_w) / float(preferred_width),
+                float(usable_h) / float(preferred_height),
+            )
+            width = max(120, int(round(preferred_width * scale)))
+            height = max(200, int(round(preferred_height * scale)))
+        else:
+            width = preferred_width
+            height = preferred_height
+
+        chrome_w = 0
+        chrome_h = 0
         inset_left = 0
         inset_top = 0
-
-        if use_auto:
-            width, height = self.calc_tight_row_cell(
-                len(ids),
-                aspect_w=aspect_w,
-                aspect_h=aspect_h,
-                screen_w=screen_w,
-                screen_h=screen_h,
-                start_x=start_x,
-                start_y=start_y,
-                chrome_w=chrome_w,
-                chrome_h=chrome_h,
-            )
-        else:
-            width = int(width or 480)
-            height = int(height or 860)
 
         hwnds: dict[int, int] = {}
         for idx in ids:
@@ -1531,8 +1542,8 @@ class MuMuManager:
                 except Exception:
                     pass
 
-        render_w = max(100, int(width) - int(chrome_w))
-        step_x = render_w if use_auto else (int(width) + int(margin))
+        # 先按窗口外框宽度严格从左到右排，不再用估算 chrome 预先重叠窗口。
+        step_x = int(width) + int(effective_margin)
         placed = 0
         for i, idx in enumerate(ids):
             mx = int(start_x) + i * int(step_x) - int(inset_left)
@@ -1554,60 +1565,33 @@ class MuMuManager:
                 inset_left = int(m.get("inset_left") or 0)
             if m.get("inset_top") is not None:
                 inset_top = int(m.get("inset_top") or 0)
-            if m.get("outer_w"):
-                width = int(m.get("outer_w") or width)
-            if m.get("outer_h"):
-                height = int(m.get("outer_h") or height)
 
-        if use_auto:
-            width, height = self.calc_tight_row_cell(
-                len(ids),
-                aspect_w=aspect_w,
-                aspect_h=aspect_h,
-                screen_w=screen_w,
-                screen_h=screen_h,
-                start_x=start_x,
-                start_y=start_y,
-                chrome_w=chrome_w,
-                chrome_h=chrome_h,
-            )
-            render_w = max(100, int(width) - int(chrome_w))
-            step_x = render_w
-            for i, idx in enumerate(ids):
-                target_rl = int(start_x) + i * int(step_x)
-                mx = target_rl - int(inset_left)
-                my = int(start_y)
-                self._set_main_window_rect(
-                    idx, mx, my, int(width), int(height), hwnd=hwnds.get(idx), title=str(idx)
-                )
-            time.sleep(0.1)
-
-            measures2 = [self.measure_player_window_win32(idx, hwnd=hwnds.get(idx)) for idx in ids]
-            gaps = []
-            for i in range(len(measures2) - 1):
-                a = measures2[i]
-                b = measures2[i + 1]
-                if a.get("render_right") is not None and b.get("render_left") is not None:
-                    gaps.append(int(b["render_left"]) - int(a["render_right"]))
-            if gaps:
-                gap = sorted(gaps)[len(gaps) // 2]
-                if abs(gap) >= 1:
-                    step_x = max(100, int(step_x) + int(gap))
-                    for i, idx in enumerate(ids):
-                        target_rl = int(start_x) + i * int(step_x)
-                        m = measures2[i] if i < len(measures2) else {}
-                        il = int(m.get("inset_left") or inset_left or 0)
-                        ow = int(m.get("outer_w") or width)
-                        oh = int(m.get("outer_h") or height)
-                        self._set_main_window_rect(
-                            idx,
-                            target_rl - il,
-                            int(start_y),
-                            ow,
-                            oh,
-                            hwnd=hwnds.get(idx),
-                            title=str(idx),
-                        )
+        # 如 render 实测仍有统一间隙/重叠，只校正一次。旧实现使用 +gap，
+        # 遇到负 gap 会进一步加重重叠；这里必须从步长中减去 gap。
+        measures2 = [self.measure_player_window_win32(idx, hwnd=hwnds.get(idx)) for idx in ids]
+        gaps = []
+        for i in range(len(measures2) - 1):
+            a = measures2[i]
+            b = measures2[i + 1]
+            if a.get("render_right") is not None and b.get("render_left") is not None:
+                gaps.append(int(b["render_left"]) - int(a["render_right"]))
+        if gaps:
+            gap = sorted(gaps)[len(gaps) // 2]
+            if abs(gap) >= 1:
+                step_x = max(100, int(step_x) - int(gap))
+                for i, idx in enumerate(ids):
+                    target_rl = int(start_x) + i * int(step_x)
+                    m = measures2[i] if i < len(measures2) else {}
+                    il = int(m.get("inset_left") or inset_left or 0)
+                    self._set_main_window_rect(
+                        idx,
+                        target_rl - il,
+                        int(start_y),
+                        int(width),
+                        int(height),
+                        hwnd=hwnds.get(idx),
+                        title=str(idx),
+                    )
 
         return {
             "count": len(ids),
@@ -1615,7 +1599,7 @@ class MuMuManager:
             "indices": ids,
             "width": int(width),
             "height": int(height),
-            "margin": 0 if use_auto else int(margin),
+            "margin": int(effective_margin),
             "step_x": int(step_x),
             "chrome_w": int(chrome_w),
             "chrome_h": int(chrome_h),
@@ -1624,6 +1608,7 @@ class MuMuManager:
             "start_x": int(start_x),
             "start_y": int(start_y),
             "auto_fit": bool(use_auto),
+            "compact_cap": True,
             "tile": "win32_no_manager_lock",
         }
 

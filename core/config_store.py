@@ -43,9 +43,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "adb_base_port": 16384,
     "adb_port_step": 32,
-    # SOCKS5 change-ip: 同链接最短间隔(秒)；刷新后等待再测网
+    # SOCKS5 change-ip: 同链接最短间隔；启动前刷新后等10秒并多次复测
     "proxy_refresh_min_interval_seconds": 180,
-    "proxy_refresh_wait_seconds": 5,
+    "proxy_refresh_wait_seconds": 10,
+    "proxy_startup_check_rounds": 5,
+    "proxy_startup_check_gap_seconds": 10,
     # 无网络刷IP成功后，对当前账号最多再试几次
     "no_network_retry_after_refresh": 1,
     # step4 停止/选择

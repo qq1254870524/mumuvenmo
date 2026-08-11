@@ -10,7 +10,7 @@
 - 增加 last_refresh_ts / 3 分钟限流
 - 增加 refresh_and_wait_network（刷新→等待→连通性）
 - 主机侧与设备侧网络探测
-- 导入 NekoBox 前：主机经 SOCKS5 测连通；不通则刷 IP、等 5 秒再测，通了才导入
+- 导入 NekoBox 前：主机经 SOCKS5 测连通；不通则刷 IP、等 10 秒后多次复测，通了才导入
 - 2026-07-24 recycle: rebind(old_key,new_key) 删建模拟器后迁移 sticky SOCKS5 绑定
 - 2026-07-25 reassign-atomic-v1:
   * reassign 换绑时整包切换 ProxyProfile（SOCKS5 + change-ip 刷新链接一体）
@@ -21,6 +21,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import socket
 import struct
@@ -31,15 +33,16 @@ from pathlib import Path
 from typing import Callable, Optional
 from urllib.request import Request, urlopen
 
-from paths import PROXY_FILE, ensure_under_root
+from paths import DATA_STATE_DIR, PROXY_FILE, ensure_under_root
 
 PROFILE_RE = re.compile(r"\.([a-zA-Z]+\d+)_pp\b")
 PROFILE_PATH_RE = re.compile(r"/([a-zA-Z]+\d+)_pp/")
 CHANGE_IP_RE = re.compile(r"https?://\S*change-ip\S+", re.I)
 
-# 默认：3 分钟限流、刷新后等 5 秒
+# 默认：3 分钟限流、刷新后等 10 秒
 DEFAULT_MIN_REFRESH_INTERVAL = 180.0
-DEFAULT_REFRESH_WAIT_SECONDS = 5.0
+DEFAULT_REFRESH_WAIT_SECONDS = 10.0
+DEFAULT_REFRESH_STATE_FILE = DATA_STATE_DIR / "proxy_refresh_state.json"
 DEFAULT_NETWORK_CHECK_URLS = (
     "http://connectivitycheck.gstatic.com/generate_204",
     "http://www.gstatic.com/generate_204",
@@ -78,6 +81,9 @@ def parse_proxy_line(line: str) -> Optional[ProxyProfile]:
     raw = line.strip()
     if not raw or raw.startswith("#"):
         return None
+    # GUI 持久化格式为 proxy|change-ip-url；这里只解析左侧 SOCKS5。
+    if "|" in raw:
+        raw = raw.split("|", 1)[0].strip()
     # 跳过刷新链接行
     if raw.lower().startswith("http://") or raw.lower().startswith("https://"):
         return None
@@ -102,9 +108,9 @@ def parse_proxy_line(line: str) -> Optional[ProxyProfile]:
     if m:
         profile = m.group(1)
     else:
-        # 回退：用户名最后一段去 _pp
-        tail = username.split(".")[-1]
-        profile = tail.replace("_pp", "") if tail else username
+        # 普通用户名不含 xxx_pp 时生成稳定短名，避免不同 endpoint 同名互相去重。
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+        profile = f"proxy_{digest}"
     return ProxyProfile(
         host=host,
         port=port,
@@ -113,6 +119,21 @@ def parse_proxy_line(line: str) -> Optional[ProxyProfile]:
         profile_name=profile,
         raw=raw,
     )
+
+
+def parse_proxy_pair_line(line: str) -> tuple[str, str] | None:
+    """解析 GUI 的 ``host:port:user:password|change-url`` 单行格式。"""
+    raw = str(line or "").strip()
+    if not raw or raw.startswith("#") or "|" not in raw:
+        return None
+    proxy_text, change_url = raw.split("|", 1)
+    proxy_text = proxy_text.strip()
+    change_url = change_url.strip()
+    if not parse_proxy_line(proxy_text):
+        return None
+    if not re.match(r"^https?://\S+$", change_url, re.I):
+        return None
+    return proxy_text, change_url
 
 
 def parse_change_ip_line(line: str) -> tuple[str, str] | None:
@@ -148,25 +169,81 @@ def load_change_ip_map(text_or_path: str | Path) -> dict[str, str]:
     return mapping
 
 
-def load_proxies(path: str | Path | None = None) -> list[ProxyProfile]:
-    """加载 SOCKS5，并自动挂上同文件中的 change-ip。"""
+def load_proxy_entries(path: str | Path | None = None) -> list[tuple[str, str]]:
+    """按 GUI 行加载 ``(SOCKS5, 刷新链接)``，兼容旧版分段文件。"""
     p = ensure_under_root(path or PROXY_FILE)
     if not p.exists():
         return []
     text = p.read_text(encoding="utf-8", errors="replace")
-    change_map = load_change_ip_map(text)
-    out: list[ProxyProfile] = []
+    legacy_change_map = load_change_ip_map(text)
+    out: list[tuple[str, str]] = []
     seen: set[str] = set()
     for line in text.splitlines():
-        item = parse_proxy_line(line)
+        pair = parse_proxy_pair_line(line)
+        if pair:
+            proxy_text, change_url = pair
+            item = parse_proxy_line(proxy_text)
+        else:
+            item = parse_proxy_line(line)
+            if not item:
+                continue
+            proxy_text = item.raw
+            change_url = legacy_change_map.get(item.profile_name, "")
+        if not item or item.profile_name in seen:
+            continue
+        seen.add(item.profile_name)
+        out.append((proxy_text, change_url))
+    return out
+
+
+def save_proxy_entries(
+    entries: list[tuple[str, str]],
+    path: str | Path | None = None,
+) -> int:
+    """校验并原子保存 GUI 代理池；每个 SOCKS5 与自己的刷新链接同一行。"""
+    p = ensure_under_root(path or PROXY_FILE)
+    clean: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for row_no, (proxy_text, change_url) in enumerate(entries, 1):
+        proxy_text = str(proxy_text or "").strip()
+        change_url = str(change_url or "").strip()
+        if not proxy_text and not change_url:
+            continue
+        item = parse_proxy_line(proxy_text)
+        if item is None:
+            raise ValueError(
+                f"第 {row_no} 行 SOCKS5 格式错误，应为 host:port:username:password"
+            )
+        if not re.match(r"^https?://\S+$", change_url, re.I):
+            raise ValueError(f"第 {row_no} 行刷新链接必须是完整 http/https URL")
+        if item.profile_name in seen:
+            raise ValueError(f"第 {row_no} 行与前面的 SOCKS5 重复")
+        seen.add(item.profile_name)
+        clean.append((item.raw, change_url))
+    if not clean:
+        raise ValueError("代理池至少需要一套 SOCKS5 和刷新链接")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    body = "# GUI SOCKS5代理池：每行 SOCKS5|刷新链接\n"
+    body += "\n".join(f"{proxy}|{url}" for proxy, url in clean) + "\n"
+    tmp.write_text(body, encoding="utf-8")
+    tmp.replace(p)
+    return len(clean)
+
+
+def load_proxies(path: str | Path | None = None) -> list[ProxyProfile]:
+    """加载 SOCKS5，并自动挂上同文件中的 change-ip。"""
+    out: list[ProxyProfile] = []
+    seen: set[str] = set()
+    for proxy_text, change_url in load_proxy_entries(path):
+        item = parse_proxy_line(proxy_text)
         if not item:
             continue
         # 去重：同 profile 只保留第一条
         if item.profile_name in seen:
             continue
         seen.add(item.profile_name)
-        if item.profile_name in change_map:
-            item.change_ip_url = change_map[item.profile_name]
+        item.change_ip_url = change_url
         out.append(item)
     return out
 
@@ -354,6 +431,7 @@ class ProxyPool:
         proxies: list[ProxyProfile] | None = None,
         min_refresh_interval_seconds: float = DEFAULT_MIN_REFRESH_INTERVAL,
         refresh_wait_seconds: float = DEFAULT_REFRESH_WAIT_SECONDS,
+        persist_refresh_state: bool = True,
     ):
         self._lock = threading.RLock()
         self.proxies = list(proxies or [])
@@ -362,8 +440,75 @@ class ProxyPool:
         self.allow_reuse = True  # 线程超过代理数时允许复用
         self.min_refresh_interval_seconds = float(min_refresh_interval_seconds)
         self.refresh_wait_seconds = float(refresh_wait_seconds)
-        # profile_name -> 刷新互斥，避免同链接并发刷
+        self.persist_refresh_state = bool(persist_refresh_state)
+        self.refresh_state_path = ensure_under_root(DEFAULT_REFRESH_STATE_FILE)
+        self._refresh_state: dict[str, dict] = self._load_refresh_state()
+        self._apply_refresh_state(self.proxies)
+        # change-ip URL 指纹 -> 刷新互斥，避免同链接并发刷
         self._refresh_locks: dict[str, threading.Lock] = {}
+
+    @staticmethod
+    def _refresh_state_key(profile: ProxyProfile) -> str:
+        url = str(getattr(profile, "change_ip_url", "") or "").strip()
+        if not url:
+            return ""
+        return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+    def _load_refresh_state(self) -> dict[str, dict]:
+        if not self.persist_refresh_state or not self.refresh_state_path.exists():
+            return {}
+        try:
+            raw = json.loads(self.refresh_state_path.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    def _apply_refresh_state(self, profiles: list[ProxyProfile]) -> None:
+        now = time.time()
+        for profile in profiles:
+            key = self._refresh_state_key(profile)
+            state = self._refresh_state.get(key) if key else None
+            if not isinstance(state, dict):
+                continue
+            try:
+                ts = float(state.get("last_refresh_ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            # 只需跨重载/重启保留 3 分钟窗口；丢弃未来时间或一天前的陈旧数据。
+            if 0.0 < ts <= now + 60.0 and now - ts < 86400.0:
+                profile.last_refresh_ts = max(profile.last_refresh_ts, ts)
+                profile.last_refresh_body = str(state.get("last_refresh_body") or "")[:200]
+
+    def _persist_refresh_state(self, profile: ProxyProfile) -> None:
+        if not self.persist_refresh_state:
+            return
+        key = self._refresh_state_key(profile)
+        if not key:
+            return
+        now = time.time()
+        with self._lock:
+            self._refresh_state[key] = {
+                "last_refresh_ts": float(profile.last_refresh_ts or 0.0),
+                "last_refresh_body": str(profile.last_refresh_body or "")[:200],
+            }
+            kept: dict[str, dict] = {}
+            for state_key, state_value in self._refresh_state.items():
+                if not isinstance(state_value, dict):
+                    continue
+                try:
+                    state_ts = float(state_value.get("last_refresh_ts") or 0.0)
+                except Exception:
+                    continue
+                if 0.0 <= now - state_ts < 86400.0:
+                    kept[state_key] = state_value
+            self._refresh_state = kept
+            self.refresh_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.refresh_state_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(self._refresh_state, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self.refresh_state_path)
 
     def _profile_lock(self, profile_name: str) -> threading.Lock:
         with self._lock:
@@ -386,7 +531,18 @@ class ProxyPool:
 
     def load_file(self, path: str | Path | None = None) -> int:
         with self._lock:
+            old_state = {
+                self._refresh_state_key(p): (p.last_refresh_ts, p.last_refresh_body)
+                for p in self.proxies
+                if self._refresh_state_key(p)
+            }
             self.proxies = load_proxies(path)
+            self._refresh_state = self._load_refresh_state()
+            self._apply_refresh_state(self.proxies)
+            for p in self.proxies:
+                old = old_state.get(self._refresh_state_key(p))
+                if old and old[0] > p.last_refresh_ts:
+                    p.last_refresh_ts, p.last_refresh_body = old
             self._rr = 0
             # 不强制清 assignment，避免运行中丢 profile；调用方可 release
             return len(self.proxies)
@@ -396,6 +552,7 @@ class ProxyPool:
             for p in self.proxies:
                 if p.profile_name in mapping and mapping[p.profile_name]:
                     p.change_ip_url = mapping[p.profile_name]
+            self._apply_refresh_state(self.proxies)
 
     def names(self) -> list[str]:
         with self._lock:
@@ -596,6 +753,8 @@ class ProxyPool:
         min_interval_seconds: float | None = None,
         check_timeout: float = 10.0,
         max_refresh_rounds: int = 1,
+        post_check_rounds: int | None = None,
+        post_check_gap_seconds: float | None = None,
         stop_event: OptionalStop = None,
         force_refresh: bool = False,
     ) -> dict:
@@ -603,7 +762,7 @@ class ProxyPool:
 
         流程:
         - 主机经 SOCKS5 检测
-        - 不通且有 change-ip: 刷新 -> 等 wait_seconds(默认5s) -> 再检测
+        - 不通且有 change-ip: 刷新 -> 等 wait_seconds(默认10s) -> 多次检测
         - 通了才 ok=True，调用方才应导入 NekoBox 配置
         """
         wait_sec = float(
@@ -613,6 +772,22 @@ class ProxyPool:
             self.min_refresh_interval_seconds
             if min_interval_seconds is None
             else min_interval_seconds
+        )
+        post_checks = max(
+            1,
+            int(
+                getattr(self, "post_refresh_check_rounds", 3)
+                if post_check_rounds is None
+                else post_check_rounds
+            ),
+        )
+        post_gap = max(
+            0.0,
+            float(
+                getattr(self, "post_refresh_check_gap", 5.0)
+                if post_check_gap_seconds is None
+                else post_check_gap_seconds
+            ),
         )
         result: dict = {
             "ok": False,
@@ -637,6 +812,39 @@ class ProxyPool:
         def _check() -> bool:
             result["checks"] = int(result["checks"]) + 1
             return check_proxy_profile_host(profile, timeout=check_timeout)
+
+        def _post_refresh_checks(
+            success_status: str,
+            failure_status: str,
+        ) -> bool:
+            """刷新请求后先等 wait_sec，再按 post_gap 做多次 SOCKS5 检查。"""
+            waited = self._interruptible_sleep(wait_sec, stop_event=stop_event)
+            result["waited"] = float(result.get("waited") or 0.0) + waited
+            if _stopped():
+                result["status"] = "stopped"
+                return False
+            for ci in range(post_checks):
+                if _stopped():
+                    result["status"] = "stopped"
+                    return False
+                ok_after = _check()
+                result["proxy_ok"] = ok_after
+                result["post_check_index"] = ci
+                if ok_after:
+                    result["ok"] = True
+                    result["status"] = success_status
+                    return True
+                if ci + 1 < post_checks:
+                    waited_more = self._interruptible_sleep(
+                        post_gap,
+                        stop_event=stop_event,
+                    )
+                    result["waited"] = (
+                        float(result.get("waited") or 0.0) + waited_more
+                    )
+            result["ok"] = False
+            result["status"] = failure_status
+            return False
 
         if _stopped():
             result["status"] = "stopped"
@@ -681,45 +889,18 @@ class ProxyPool:
                     result["remaining_seconds"] = self.remaining_refresh_seconds(
                         profile, interval
                     )
-                ok2 = _check()
-                result["proxy_ok"] = ok2
-                result["ok"] = ok2
-                if ok2:
-                    result["status"] = "ok_while_rate_limited"
+                _post_refresh_checks("ok_while_rate_limited", "rate_limited")
                 return result
             if body.startswith("change_ip_error:"):
                 result["status"] = "refresh_error"
-                ok2 = _check()
-                result["proxy_ok"] = ok2
-                result["ok"] = ok2
-                if ok2:
-                    result["status"] = "ok_after_refresh_error"
+                _post_refresh_checks("ok_after_refresh_error", "refresh_error")
                 return result
 
             result["refreshed"] = True
-            # 刷新后至少等 wait_sec，再做多轮主机 SOCKS5 检测（IP 切换常需额外几秒）
-            waited = self._interruptible_sleep(wait_sec, stop_event=stop_event)
-            result["waited"] = float(result.get("waited") or 0.0) + waited
-            if _stopped():
-                result["status"] = "stopped"
+            if _post_refresh_checks("refreshed_ok", "proxy_down_after_refresh"):
                 return result
-            post_checks = max(1, int(getattr(self, "post_refresh_check_rounds", 3) or 3))
-            post_gap = float(getattr(self, "post_refresh_check_gap", 5.0) or 5.0)
-            ok2 = False
-            for ci in range(post_checks):
-                if _stopped():
-                    result["status"] = "stopped"
-                    return result
-                ok2 = _check()
-                result["proxy_ok"] = ok2
-                if ok2:
-                    result["ok"] = True
-                    result["status"] = "refreshed_ok"
-                    result["post_check_index"] = ci
-                    return result
-                if ci + 1 < post_checks:
-                    waited2 = self._interruptible_sleep(post_gap, stop_event=stop_event)
-                    result["waited"] = float(result.get("waited") or 0.0) + waited2
+            if _stopped():
+                return result
 
         result["ok"] = False
         result["status"] = "proxy_down_after_refresh"
@@ -733,7 +914,7 @@ class ProxyPool:
         min_interval_seconds: float | None = None,
         force: bool = False,
         mark_timestamp: bool = True,
-        max_http_retries: int = 2,
+        max_http_retries: int = 0,
     ) -> str:
         """触发 change-ip。默认 3 分钟限流；force=True 跳过限流。
 
@@ -752,7 +933,8 @@ class ProxyPool:
             if min_interval_seconds is None
             else min_interval_seconds
         )
-        plock = self._profile_lock(profile.profile_name)
+        refresh_key = self._refresh_state_key(profile) or profile.profile_name
+        plock = self._profile_lock(refresh_key)
         with plock:
             if not force:
                 left = self.remaining_refresh_seconds(profile, interval)
@@ -760,8 +942,14 @@ class ProxyPool:
                     return f"rate_limited:{int(left) + 1}s"
 
             last_err = ""
-            retries = max(1, int(max_http_retries) + 1)
+            # 参数仅为旧调用兼容；当前规则固定每次只请求刷新链接一次。
+            retries = 1
             for attempt in range(retries):
+                # 发出刷新请求前即记录本次尝试；成功或失败都遵守同链接 3 分钟一次。
+                if mark_timestamp and attempt == 0:
+                    profile.last_refresh_ts = time.time()
+                    profile.last_refresh_body = "refresh_requested"
+                    self._persist_refresh_state(profile)
                 try:
                     req = Request(
                         profile.change_ip_url,
@@ -774,8 +962,8 @@ class ProxyPool:
                         body = resp.read(500).decode("utf-8", errors="replace")
                         text = body.strip()[:200]
                     if mark_timestamp:
-                        profile.last_refresh_ts = time.time()
                         profile.last_refresh_body = text
+                        self._persist_refresh_state(profile)
                     return text
                 except Exception as exc:
                     last_err = str(exc)
@@ -790,11 +978,10 @@ class ProxyPool:
                     if retryable and attempt + 1 < retries:
                         time.sleep(3.0 + attempt * 2.0)
                         continue
-                    # 失败也写短冷却，避免多 VM 同 profile 立刻连打
+                    # 失败也保留完整 3 分钟冷却，禁止同链接连续请求。
                     if mark_timestamp:
-                        # 失败冷却 30s（小于 3 分钟正式间隔，但挡住并发风暴）
-                        profile.last_refresh_ts = time.time() - max(0.0, interval - 30.0)
                         profile.last_refresh_body = f"change_ip_error:{last_err}"
+                        self._persist_refresh_state(profile)
                     return f"change_ip_error:{last_err}"
             return f"change_ip_error:{last_err or 'unknown'}"
 

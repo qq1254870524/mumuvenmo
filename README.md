@@ -2,6 +2,23 @@
 
 MuMu 多开 + Venmo 装包/登录自动化（本地工具）。
 
+## 2026-08-11 更新摘要
+
+- GUI SOCKS5 代理池改为每行 `代理|刷新链接`，支持 `+` 新增、`-` 删除并持久化
+- 每个 Worker 启动前独立检测绑定代理；不通时刷新一次，等待 10 秒后最多复测 5 轮
+- 同一刷新链接固定 180 秒冷却；健康代理对应的线程立即启动，不等待慢代理
+- 多选模拟器保持独立并发：首次缺包的 VM 会先自愈安装，完成后自动进入登录循环
+- 模拟器窗口固定从左上角按 360x640 紧凑一行排列；数量过多时只缩小，不再放大占满屏幕
+- 日志文件遇到占用/权限问题时自动切换到进程专用日志，不再阻止 GUI 启动
+
+代理行示例：
+
+```text
+host:port:user:pass|https://example.com/change-ip/TOKEN
+```
+
+完整说明见 [docs/UPDATE_2026-08-11.md](docs/UPDATE_2026-08-11.md)。
+
 ## 2026-07-31 更新摘要
 
 - 多开同步装包：新建 N 台可 N 台并行走完后半段（不再只剩 3~4 台）
@@ -22,7 +39,7 @@ copy accounts\input\accounts.example.txt accounts\input\import_active.txt
 ```
 
 1. 小型 APK（NekoBox / Kitsune / Aurora / Venmo splits）已随仓库提供；仅需自行放入 `assets/apk/venmo_bundle/base.apk`（约 161MB，超 GitHub 单文件限制）
-2. 编辑 `proxies\cocks5.txt` 写入 SOCKS5
+2. 在 GUI 代理池逐行填写 `代理|刷新链接`，或编辑 `proxies\cocks5.txt`
 3. 编辑 `accounts\input\import_active.txt` 写入账号
 4. 启动：
 

@@ -1,3 +1,4 @@
+# 2026-08-11 socks5-gui-pool-v3: 代理在线检查改为各 Worker 并发门禁；可用 IP 线程先启动，不通则刷新后每 10 秒多次复测
 # 2026-07-31 zombie-cancel-v2: Event代际 + provision捕获cancel，旧线程不因clear复活
 # 2026-07-31 instant-stop-v2: 停止任务秒级生效(wait轮询+脉冲杀adb+跳过收尾)
 # 2026-07-25 stop-task-force-v1: 顶栏【■ 停止任务】强制中断新建/装包/后台任务；_run_bg 可取消
@@ -48,7 +49,12 @@ from core.account_store import AccountStore, load_accounts_from_file, load_accou
 from core.config_store import load_config, save_config
 from core.logger_util import UiLogBridge, setup_logger
 from core.mumu_manager import MuMuManager
-from core.proxy_pool import ProxyPool, load_change_ip_map
+from core.proxy_pool import (
+    ProxyPool,
+    load_change_ip_map,
+    load_proxy_entries,
+    save_proxy_entries,
+)
 from core.worker_engine import WorkerEngine
 from paths import (
     ACCOUNTS_SAMPLES_DIR,
@@ -144,8 +150,8 @@ class App(tk.Tk):
         super().__init__()
         self.title("MuMu Venmo 登录器")
         # 窗口恢复上一次大小；排版仍用两行，避免右侧按钮被挡
-        self.geometry("1080x700")
-        self.minsize(880, 560)
+        self.geometry("1180x820")
+        self.minsize(980, 680)
 
         self.cfg = load_config()
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -173,6 +179,9 @@ class App(tk.Tk):
         self._bg_cancel = threading.Event()
         self._bg_title = ""
         self._stopping_ui = False
+        self._proxy_editor_rows: list[dict] = []
+        self._proxy_preflight_in_progress = False
+        self._proxy_preflight_passed = False
         self._vm_check_vars: dict[int, tk.BooleanVar] = {}
         self._vm_meta: dict[int, dict] = {}
         self._build_ui()
@@ -527,6 +536,66 @@ class App(tk.Tk):
         self.lbl_assets = ttk.Label(row_inst, text=" ".join(assets_hint))
         self.lbl_assets.pack(side=tk.LEFT, padx=6)
 
+        # ===== SOCKS5 代理池：SOCKS5|change-ip 链接在同一个输入框 =====
+        proxy_box = ttk.LabelFrame(
+            self,
+            text="SOCKS5 代理池（每行：host:port:username:password|刷新链接）",
+            padding=(4, 2),
+        )
+        proxy_box.pack(fill=tk.X, padx=4, pady=(2, 0))
+        proxy_head = ttk.Frame(proxy_box)
+        proxy_head.pack(fill=tk.X)
+        ttk.Label(proxy_head, text="#", width=3).grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(
+            proxy_head,
+            text="SOCKS5|刷新链接（不通则刷新，10 秒后多次复测；可用 IP 先启动）",
+            anchor=tk.W,
+        ).grid(
+            row=0, column=1, sticky=tk.EW
+        )
+        proxy_head.columnconfigure(1, weight=1)
+        ttk.Button(
+            proxy_head,
+            text="保存代理",
+            width=_button_width("保存代理"),
+            command=lambda: self._save_proxy_editor(show_message=True),
+        ).grid(row=0, column=2, padx=(4, 1))
+        ttk.Button(
+            proxy_head,
+            text="+",
+            width=3,
+            command=self._add_proxy_editor_row,
+        ).grid(row=0, column=3, padx=(1, 0))
+
+        self.proxy_canvas = tk.Canvas(proxy_box, height=92, highlightthickness=0)
+        proxy_scroll = ttk.Scrollbar(
+            proxy_box, orient=tk.VERTICAL, command=self.proxy_canvas.yview
+        )
+        self.proxy_rows_frame = ttk.Frame(self.proxy_canvas)
+        self._proxy_canvas_window = self.proxy_canvas.create_window(
+            (0, 0), window=self.proxy_rows_frame, anchor=tk.NW
+        )
+        self.proxy_rows_frame.bind(
+            "<Configure>",
+            lambda _e: self.proxy_canvas.configure(
+                scrollregion=self.proxy_canvas.bbox("all")
+            ),
+        )
+        self.proxy_canvas.bind(
+            "<Configure>",
+            lambda e: self.proxy_canvas.itemconfigure(
+                self._proxy_canvas_window, width=e.width
+            ),
+        )
+        self.proxy_canvas.configure(yscrollcommand=proxy_scroll.set)
+        self.proxy_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        proxy_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        entries = load_proxy_entries(PROXY_FILE)
+        if not entries:
+            entries = [("", "")]
+        for proxy_text, change_url in entries:
+            self._add_proxy_editor_row(proxy_text, change_url)
+
         # ===== 导出 =====
         row_exp = ttk.Frame(self, padding=(4, 0, 4, 0))
         row_exp.pack(fill=tk.X)
@@ -654,6 +723,140 @@ class App(tk.Tk):
             pass
 
 
+    def _add_proxy_editor_row(
+        self,
+        proxy_text: str = "",
+        change_url: str = "",
+    ) -> None:
+        """GUI 增加一行 ``SOCKS5|刷新链接``；新增行右侧显示减号。"""
+        row_frame = ttk.Frame(self.proxy_rows_frame)
+        row_frame.pack(fill=tk.X, pady=1)
+        row_frame.columnconfigure(1, weight=1)
+        pair_text = ""
+        if proxy_text or change_url:
+            pair_text = f"{proxy_text}|{change_url}"
+        row = {
+            "frame": row_frame,
+            "index": ttk.Label(row_frame, text="", width=3),
+            "pair_var": tk.StringVar(value=pair_text),
+            "minus": None,
+        }
+        row["index"].grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(row_frame, textvariable=row["pair_var"]).grid(
+            row=0, column=1, sticky=tk.EW
+        )
+        minus = ttk.Button(
+            row_frame,
+            text="-",
+            width=3,
+            command=lambda current=row: self._remove_proxy_editor_row(current),
+        )
+        minus.grid(row=0, column=2, padx=(4, 1))
+        row["minus"] = minus
+        # 与标题行“保存代理”“+”两列对齐，占位。
+        ttk.Label(row_frame, text="", width=3).grid(row=0, column=3)
+        self._proxy_editor_rows.append(row)
+        self._renumber_proxy_editor_rows()
+        try:
+            self.proxy_canvas.yview_moveto(1.0)
+        except Exception:
+            pass
+
+    def _remove_proxy_editor_row(self, row: dict) -> None:
+        if row not in self._proxy_editor_rows or len(self._proxy_editor_rows) <= 1:
+            return
+        self._proxy_editor_rows.remove(row)
+        try:
+            row["frame"].destroy()
+        except Exception:
+            pass
+        self._renumber_proxy_editor_rows()
+
+    def _renumber_proxy_editor_rows(self) -> None:
+        for i, row in enumerate(self._proxy_editor_rows, 1):
+            row["index"].configure(text=str(i))
+            # 第一套固定保留；点 + 新增的其余套均有 - 可删除。
+            row["minus"].configure(state=(tk.DISABLED if i == 1 else tk.NORMAL))
+
+    def _proxy_editor_values(self) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for row_no, row in enumerate(self._proxy_editor_rows, 1):
+            pair_text = str(row["pair_var"].get() or "").strip()
+            if not pair_text:
+                out.append(("", ""))
+                continue
+            if pair_text.count("|") != 1:
+                raise ValueError(
+                    f"第 {row_no} 行格式错误，必须用一个 | 分割 SOCKS5 和刷新链接"
+                )
+            proxy_text, change_url = (
+                part.strip() for part in pair_text.split("|", 1)
+            )
+            if not proxy_text or not change_url:
+                raise ValueError(
+                    f"第 {row_no} 行格式错误，| 左边写 SOCKS5，右边写刷新链接"
+                )
+            out.append((proxy_text, change_url))
+        return out
+
+    def _replace_proxy_editor_rows(self, entries: list[tuple[str, str]]) -> None:
+        for row in list(self._proxy_editor_rows):
+            try:
+                row["frame"].destroy()
+            except Exception:
+                pass
+        self._proxy_editor_rows.clear()
+        for proxy_text, change_url in (entries or [("", "")]):
+            self._add_proxy_editor_row(proxy_text, change_url)
+
+    def _save_proxy_editor(self, *, show_message: bool = False) -> bool:
+        """校验 GUI 内容、保存成对代理并立即重载运行时代理池。"""
+        try:
+            n = save_proxy_entries(self._proxy_editor_values(), PROXY_FILE)
+            n2 = self.proxy_pool.load_file(PROXY_FILE)
+            ideas = DOCS_DIR / "思路.txt"
+            if ideas.exists():
+                self.proxy_pool.attach_change_ip(load_change_ip_map(ideas))
+            self.proxy_pool.configure(
+                min_refresh_interval_seconds=float(
+                    self.cfg.get("proxy_refresh_min_interval_seconds", 180)
+                ),
+                refresh_wait_seconds=float(
+                    self.cfg.get("proxy_refresh_wait_seconds", 5)
+                ),
+            )
+        except Exception as exc:
+            self._log(f"代理池保存失败: {exc}")
+            messagebox.showerror("代理池格式错误", str(exc))
+            return False
+        self._log(f"代理池已保存并重载: {n} 套，运行时={n2}")
+        if show_message:
+            messagebox.showinfo("代理池", f"已保存 {n} 套 SOCKS5 + 刷新链接")
+        return True
+
+    def _begin_proxy_preflight(self) -> bool:
+        """保存代理池；实际连通门禁由各 Worker 并发执行，避免慢代理阻塞可用代理。"""
+        if self._proxy_preflight_in_progress:
+            return True
+        if not self._save_proxy_editor(show_message=False):
+            return True
+        if not bool(self.var_nekobox.get()):
+            return False
+        profiles = list(self.proxy_pool.proxies)
+        if not profiles:
+            messagebox.showerror("代理池", "启用 NekoBox 时至少需要一套有效 SOCKS5 + 刷新链接")
+            return True
+        self.proxy_pool.configure(
+            min_refresh_interval_seconds=180.0,
+            refresh_wait_seconds=10.0,
+        )
+        self._log(
+            f"启动前代理并发门禁已准备: {len(profiles)} 套；"
+            "各 Worker 独立检查，可用 IP 立即继续，不通 IP 刷新后每 10 秒多次复测"
+        )
+        return False
+
+
     def _bind_tooltip(self, widget, text: str) -> None:
         """鼠标悬停显示完整说明（不缩写）。"""
         tip = {"win": None}
@@ -731,6 +934,11 @@ class App(tk.Tk):
         self.cfg["restart_interval_minutes"] = float(self.var_restart.get() or 0)
         self.cfg["login_timeout_seconds"] = int(self.var_login_timeout.get())
         self.cfg["boot_timeout_seconds"] = int(self.var_boot_timeout.get())
+        # change-ip 固定 3 分钟冷却；GUI/WorkerEngine 共用该值。
+        self.cfg["proxy_refresh_min_interval_seconds"] = 180
+        self.cfg["proxy_refresh_wait_seconds"] = 10
+        self.cfg["proxy_startup_check_rounds"] = 5
+        self.cfg["proxy_startup_check_gap_seconds"] = 10
         venmo_local = bool(self.var_venmo_local.get()) if hasattr(self, "var_venmo_local") else True
         venmo_aurora = bool(self.var_venmo_via_aurora.get()) if hasattr(self, "var_venmo_via_aurora") else False
         # 勾选 AuroraStore 安装 Venmo 时，确保也装 Aurora 商店
@@ -1881,9 +2089,12 @@ class App(tk.Tk):
         ideas = DOCS_DIR / "思路.txt"
         if ideas.exists():
             self.proxy_pool.attach_change_ip(load_change_ip_map(ideas))
+        self._replace_proxy_editor_rows(load_proxy_entries(PROXY_FILE))
         self._log(f"重载代理 {n} 条 profiles={self.proxy_pool.names()}")
 
     def save_settings(self) -> None:
+        if not self._save_proxy_editor(show_message=False):
+            return
         cfg = self._collect_cfg()
         save_config(cfg)
         self._log("配置已保存")
@@ -1939,6 +2150,13 @@ class App(tk.Tk):
             return
         if self.engine and (self.engine.running or self.engine.is_stopping()):
             messagebox.showwarning("提示", "已在登录中或正在停止，请先等待结束")
+            return
+        if self._proxy_preflight_in_progress:
+            return
+        if self._proxy_preflight_passed:
+            # 只放行这一次递归启动；下次点击仍重新做启动前检查。
+            self._proxy_preflight_passed = False
+        elif self._begin_proxy_preflight():
             return
 
         # 刷新列表，确保勾选对应当前已有实例

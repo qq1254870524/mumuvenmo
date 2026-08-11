@@ -1,9 +1,10 @@
+# 2026-08-11 progressive-proxy-gate-v1: Worker 并发启动前测代理；可用 IP 先继续，不通刷新后每 10 秒多次复测
 # 2026-07-31 immediate-stop-v1: force 停登录时打断 ADB，join 上限 8s
 # 2026-07-25 layout-tight-v1: 登录线程一字紧贴排列 auto_fit margin=0
 # -*- coding: utf-8 -*-
 """多线程 Worker：启模拟器 -> STEP1 Kitsune -> 装包 -> STEP3 NekoBox代理 -> 登录 -> 导出。
 # 2026-07-24 forever-allow-v1: 定时重启0=永不; >0分钟restart后只重开VPN不查Uninstall Magisk
-# 2026-07-25 no-tun-refresh-ip-v1: NekoBox无tun时刷绑定刷新链接(3分钟限频)+等5s主机测通后重连/换绑
+# 2026-07-25 no-tun-refresh-ip-v1: NekoBox无tun时刷绑定刷新链接(3分钟限频)+等待后主机测通再重连/换绑
 # 2026-07-25 stop-wait-login-v1: 普通停止必须等当前登录完成才关模拟器；未完成不关机；仅强制停止可超时关机
 # 2026-07-25 first-setup-vpn-gate-v1 REVERTED: 恢复 elif，不改原首次setup/STEP3流程
 
@@ -19,7 +20,7 @@
 - priority-check-v1: 启动后第一件事必须 Kitsune；缓存也轻量确认 Uninstall Magisk；NekoBox/代理 UI 严禁抢前
 - 登录前不再每次 change-ip
 - 仅 RISK_CONTROL / NO_NETWORK 才刷 SOCKS5
-- 刷新后等待 5 秒并测连通性；同链接 3 分钟限流
+- 启动前刷新后等待 10 秒并多次测连通性；同链接 3 分钟限流
 - WRONG_PASSWORD 不刷 IP
 - NO_NETWORK 刷 IP 成功后可重试当前账号一次
 - 窗口仅 layout_row_from_top_left 单行左上角排列，禁止 MuMu sort 网格
@@ -318,7 +319,7 @@ class WorkerEngine:
         use = self._vm_indices[:workers]
         self.log(f"启动 {len(use)} 个工作线程, VM={use}")
         self.log(
-            "代理刷新规则: 仅风控/无网络刷 IP; "
+            "代理刷新规则: Worker 启动前不通会刷一次；运行中仅风控/无网络刷 IP; "
             f"间隔>={self.proxy_pool.min_refresh_interval_seconds}s; "
             f"刷新后等待 {self.proxy_pool.refresh_wait_seconds}s 再测网"
         )
@@ -446,12 +447,65 @@ class WorkerEngine:
 
         return _check
 
+    def _startup_proxy_preflight(
+        self,
+        worker_id: str,
+        proxy: ProxyProfile | None,
+    ) -> dict:
+        """Worker 启动模拟器前的并发代理门禁。"""
+        if proxy is None:
+            return {
+                "ok": False,
+                "status": "no_proxy",
+                "proxy_ok": False,
+                "proxy_ok_before": False,
+                "refreshed": False,
+                "checks": 0,
+            }
+        wait_s = max(
+            10.0,
+            float(self.config.get("proxy_refresh_wait_seconds", 10) or 10),
+        )
+        check_rounds = max(
+            2,
+            int(self.config.get("proxy_startup_check_rounds", 5) or 5),
+        )
+        check_gap = max(
+            1.0,
+            float(self.config.get("proxy_startup_check_gap_seconds", 10) or 10),
+        )
+        self.log(
+            f"{worker_id} 启动前并发检查 SOCKS5 profile={proxy.profile_name} "
+            f"endpoint={proxy.endpoint}; 不通则刷新一次，等待 {wait_s:.0f}s 后 "
+            f"最多复测 {check_rounds} 次，间隔 {check_gap:.0f}s"
+        )
+        result = self.proxy_pool.ensure_ready_before_import(
+            proxy,
+            wait_seconds=wait_s,
+            min_interval_seconds=float(
+                self.config.get("proxy_refresh_min_interval_seconds", 180) or 180
+            ),
+            check_timeout=10.0,
+            max_refresh_rounds=1,
+            post_check_rounds=check_rounds,
+            post_check_gap_seconds=check_gap,
+            stop_event=self._stop,
+            force_refresh=False,
+        )
+        self.log(
+            f"{worker_id} 启动前代理门禁结果 profile={proxy.profile_name} "
+            f"status={result.get('status')} ok={result.get('ok')} "
+            f"before={result.get('proxy_ok_before')} refreshed={result.get('refreshed')} "
+            f"checks={result.get('checks')} waited={result.get('waited')}"
+        )
+        return result
+
     def _ensure_proxy_ready_before_import(
         self,
         worker_id: str,
         proxy: ProxyProfile | None,
     ) -> dict:
-        """导入/启动 NekoBox 前：主机检查代理连通，不通则刷 IP 等 5 秒再测。"""
+        """导入/启动 NekoBox 前：主机检查代理连通，不通则刷 IP 后再测。"""
         if proxy is None:
             self.log(f"{worker_id} 导入前代理检查跳过: 无代理")
             return {
@@ -847,6 +901,31 @@ class WorkerEngine:
             )
         else:
             self.log(f"{worker_id} 无可用 SOCKS5 代理配置")
+
+        # 每个 Worker 在启动模拟器前独立做代理门禁。线程并发执行，因此健康 IP
+        # 立即继续；慢/坏 IP 只阻塞自己的 Worker，不再拖住全部线程。
+        if bool(self.config.get("use_nekobox", True)):
+            startup_proxy = self._startup_proxy_preflight(worker_id, proxy)
+            if not bool(startup_proxy.get("ok")):
+                self.log(
+                    f"{worker_id} 启动前代理多次复测仍未通过 "
+                    f"profile={profile_name} status={startup_proxy.get('status')}，"
+                    "本 Worker 不启动模拟器"
+                )
+                try:
+                    self.proxy_pool.release(f"vm-{vmindex}")
+                except Exception:
+                    pass
+                try:
+                    with self._lock:
+                        self._vm_proxy.pop(int(vmindex), None)
+                except Exception:
+                    pass
+                return
+            self.log(
+                f"{worker_id} 启动前代理已连通 profile={profile_name} "
+                f"status={startup_proxy.get('status')}，立即启动本线程"
+            )
 
         defaults = self.config.get("create_defaults", {}) or {}
         boot_timeout = int(self.config.get("boot_timeout_seconds", 240))
@@ -1622,5 +1701,3 @@ class WorkerEngine:
         self.proxy_pool.release(f"vm-{vmindex}")
         self.log(f"{worker_id} 线程结束 VM={vmindex}")
         self.log(f"{worker_id} 结束")
-
-
