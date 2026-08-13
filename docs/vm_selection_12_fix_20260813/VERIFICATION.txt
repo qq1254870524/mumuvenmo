@@ -1,0 +1,112 @@
+MuMuVenmo workers=12 仅 11 台运行修复验证
+时间: 2026-08-13 Asia/Shanghai
+
+[对象与状态]
+LIVE_SOURCE=E:\mumuvenmo\app_ui.py
+ORIGINAL_SHA256=B4D6BF9C8B7829BAEBDF0F238B3020153F6721A300C92CB48AB36803C72FA662
+MODIFIED_SHA256=EEA38BC27C33D13E8C1DC57B0990265BAAB1E6509CC43551EEF28DD276B88AD6
+LIVE_STATE=MODIFIED
+
+[根因]
+启动按钮进入 start_login 后会先 refresh_vms；旧 refresh 分支优先使用已有的 0..10 勾选状态，覆盖文本框/last_selected_vms 中刚加入的 VM11。因此 workers=12 时引擎实际只收到 11 个 VM ID。工作线程引擎本身没有 11 台上限。
+
+[变更分支/字段]
+BRANCH_1=_selection_snapshot_before_refresh: 文本选择与旧勾选不一致时，保留更新的文本选择。
+BRANCH_2=start_login -> refresh_vms(prefer_checked=requested_before_refresh): 刷新列表不再丢失第 12 台。
+BRANCH_3=create_vm_only/create_vm_and_launch: selected_before_create 与 new_ids 合并，再由 _apply_vm_selection 原子同步。
+FIELDS=cfg.last_selected_vms,var_vms,vm_vars
+UNCHANGED_FIELD=workers=12
+
+[四个事务工件]
+MODIFIED_FILE=E:\mumuvenmo\docs\vm_selection_12_fix_20260813\MODIFIED_FILE.zip
+DIFF_FILE=E:\mumuvenmo\docs\vm_selection_12_fix_20260813\DIFF_FILE.patch
+VERIFICATION=E:\mumuvenmo\docs\vm_selection_12_fix_20260813\VERIFICATION.txt
+ROLLBACK=E:\mumuvenmo\docs\vm_selection_12_fix_20260813\ROLLBACK.sh
+
+[BASELINE]
+COMMAND=PowerShell: $py=<以下 INPUT Python>; $py | python -B -; $ec=$LASTEXITCODE; "BASELINE_EXIT=$ec"
+INPUT:
+checked=list(range(11))
+typed=list(range(12))
+workers=12
+old=checked if checked else typed
+print('INPUT checked='+','.join(map(str,checked))+' typed='+','.join(map(str,typed))+' workers='+str(workers))
+print('OLD_REFRESH_PREFERRED='+','.join(map(str,old)))
+print('OLD_LOGIN_VM_COUNT='+str(len(old)))
+print('BASELINE_SELECTION_TEST=PASS reproduced=workers12_only11')
+LITERAL_OUTPUT:
+INPUT checked=0,1,2,3,4,5,6,7,8,9,10 typed=0,1,2,3,4,5,6,7,8,9,10,11 workers=12
+OLD_REFRESH_PREFERRED=0,1,2,3,4,5,6,7,8,9,10
+OLD_LOGIN_VM_COUNT=11
+BASELINE_SELECTION_TEST=PASS reproduced=workers12_only11
+BASELINE_EXIT=0
+STATUS=PASS，已复现旧分支把 12 台降为 11 台。
+
+[MODIFIED]
+COMMAND=PowerShell: $py=<以下 INPUT Python>; $py | python -B -; $ec=$LASTEXITCODE; "MODIFIED_EXIT=$ec"
+INPUT:
+from pathlib import Path
+import ast
+p=Path(r'E:\mumuvenmo\app_ui.py')
+s=p.read_text(encoding='utf-8-sig')
+ast.parse(s)
+checked=list(range(11)); typed=list(range(12)); workers=12
+snapshot=typed if typed and typed != checked else (checked or typed)
+refresh_preserves12=('def refresh_vms(self, *, prefer_checked:' in s and 'requested_before_refresh = self._selection_snapshot_before_refresh()' in s and 'self.refresh_vms(prefer_checked=requested_before_refresh)' in s)
+create_merges_new=('selected_before_create = self._selection_snapshot_before_refresh()' in s and '+ [int(i) for i in new_ids]' in s and 'self._apply_vm_selection(target, persist=True)' in s)
+print('INPUT checked='+','.join(map(str,checked))+' typed='+','.join(map(str,typed))+' workers='+str(workers))
+print('SNAPSHOT='+','.join(map(str,snapshot)))
+print('SNAPSHOT_COUNT='+str(len(snapshot)))
+print(f'MODIFIED_SELECTION_TEST=PASS refresh_preserves12={refresh_preserves12} create_merges_new={create_merges_new}')
+print('MODIFIED_AST_OK=True')
+assert len(snapshot)==12 and refresh_preserves12 and create_merges_new
+LITERAL_OUTPUT:
+INPUT checked=0,1,2,3,4,5,6,7,8,9,10 typed=0,1,2,3,4,5,6,7,8,9,10,11 workers=12
+SNAPSHOT=0,1,2,3,4,5,6,7,8,9,10,11
+SNAPSHOT_COUNT=12
+MODIFIED_SELECTION_TEST=PASS refresh_preserves12=True create_merges_new=True
+MODIFIED_AST_OK=True
+MODIFIED_EXIT=0
+STATUS=PASS，源码 AST 正常，刷新保留 12 台，新建分支合并新 VM。
+
+[ROLLBACK]
+COMMAND=wsl.exe -e bash /mnt/e/mumuvenmo/docs/vm_selection_12_fix_20260813/ROLLBACK.sh /mnt/c/Users/zhang/Desktop/codex_tmp/mumuvenmo_12vm_selection_rollback_probe_20260813_1743
+INPUT=一份 MODIFIED app_ui.py 的独立副本；TARGET_ROOT=/mnt/c/Users/zhang/Desktop/codex_tmp/mumuvenmo_12vm_selection_rollback_probe_20260813_1743
+LITERAL_OUTPUT:
+ROLLBACK_APP_SHA256=B4D6BF9C8B7829BAEBDF0F238B3020153F6721A300C92CB48AB36803C72FA662
+ROLLBACK_AST_OK=True
+RESTORED_BEHAVIOR=refresh prefers existing 11 checked VMs and can drop newly typed VM11
+ROLLBACK_EXIT=0
+ROLLBACK_HASH=B4D6BF9C8B7829BAEBDF0F238B3020153F6721A300C92CB48AB36803C72FA662
+ROLLBACK_HASH_MATCH=True
+LIVE_HASH=EEA38BC27C33D13E8C1DC57B0990265BAAB1E6509CC43551EEF28DD276B88AD6
+LIVE_STILL_MODIFIED=True
+STATUS=PASS，测试副本恢复原始哈希和旧行为；正式源码保持修复状态。
+
+[真实运行验证]
+COMMAND=python.exe -B main.py（MUMUVENMO_AUTO_START=1, MUMUVENMO_WORKERS=12, MUMUVENMO_VMS=0,1,2,3,4,5,6,7,8,9,10,11）
+INPUT=workers=12; VM IDs=0..11; 登录账号源=GUI 当前配置的导入文件
+LITERAL_RESULT:
+2026-08-13 17:36:09,220 [INFO] MainThread ADB流控: 多开=12、登录线程=12 全部运行；启动派发=1，ADB命令并发=7
+2026-08-13 17:36:09,221 [INFO] MainThread 启动 12 个工作线程, VM=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+2026-08-13 17:38:15,118 [INFO] VM-11 worker-11 绑定模拟器 index=11
+2026-08-13 17:40:14,281 [INFO] VM-11 worker-11 VM=11 Android 已启动 state=start_finished
+2026-08-13 17:40:44,208 [INFO] VM-11 worker-11 ADB 就绪 serial=127.0.0.1:16736 round=1
+2026-08-13 17:43:25,820 [INFO] VM-11 worker-11 form ready=True texts='Email, username, or phone number\nPassword\nPassword Toggle\nForgot password?\nLog in\nCreate account\nCreate account'
+GUI_PID=91072
+GUI_RESPONDING=True
+HEADLESS=12
+DEVICEPROC=12
+ADB_DEVICE=12
+ERRORS=0
+EXIT_STATUS=RUNNING（任务按原配置继续执行，未停止）
+STATUS=PASS，12 个工作线程已创建，12 台模拟器和 12 个 ADB 设备均在线；第 12 台已进入 Venmo 登录表单。
+
+[配置持久化]
+COMMAND=python -B 读取 E:\mumuvenmo\config.json 的 workers/last_selected_vms
+LITERAL_OUTPUT:
+workers=12
+last_selected_vms=0,1,2,3,4,5,6,7,8,9,10,11
+selected_count=12
+EXIT_STATUS=0
+

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-08-13 — workers=12 完整启动 12 台模拟器
+
+- 修复点击启动后 `refresh_vms` 使用旧勾选快照覆盖文本框/配置中新加入 VM11，导致 `workers=12` 实际只向引擎传入 11 个 VM ID。
+- 新增 `_selection_snapshot_before_refresh`：文本选择与旧勾选不一致时保留更新较新的文本选择。
+- `start_login` 在刷新列表前冻结请求选择，并通过 `refresh_vms(prefer_checked=...)` 原样恢复。
+- 新建模拟器流程把原选择与 `new_ids` 合并，再由 `_apply_vm_selection(..., persist=True)` 同步 `cfg.last_selected_vms`、`var_vms` 和 `vm_vars`。
+- 实机确认 12 个 Worker、VM0–VM11、12 个 Headless/Device 进程和 12 个 ADB device 全部运行；VM11 已进入 Venmo 登录表单，GUI 保持响应，错误数 0。
+
 ## 2026-08-12 — 11 开流畅并发、ADB 命令级调度与无运行截图正式版
 
 - 每个勾选模拟器使用独立 Worker；启动按 8 秒间隔提前派发，慢代理或慢启动不再阻塞后续健康模拟器。
